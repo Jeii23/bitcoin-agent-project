@@ -1,0 +1,73 @@
+#!/usr/bin/env python3
+"""
+Test simple per verificar que l'Agent IA funciona
+"""
+
+import asyncio
+import os
+import sys
+from pathlib import Path
+
+# Afegir el directori src al path
+sys.path.append(str(Path(__file__).parent))
+
+# Carregar .env
+from dotenv import load_dotenv
+load_dotenv()
+
+async def test_agent():
+    """Test bàsic de l'agent"""
+    
+    # Importar després de configurar el path
+    from bitcoin_ai_agent import BitcoinAIAgent
+    
+    print("🧪 TEST DE L'AGENT IA BITCOIN")
+    print("=" * 50)
+    
+    # Obtenir configuració
+    api_key = os.getenv("OPENAI_API_KEY")
+    xpub = os.getenv("BITCOIN_XPUB", "tpubD6NzVbkrYhZ4XgiXtFtukm3UvC3J3qTtmqYe2HhLUfRr7dW3JQgFVPuTqCvmKPNBPidLhPXF5ibXXrBhKBpvPyrqsQQcz8MJjwVwqkqqu3y")
+    network = os.getenv("BITCOIN_NETWORK", "testnet")
+    
+    if not api_key or api_key == "your-key-here":
+        print("❌ No s'ha trobat API key vàlida al .env")
+        return
+    
+    print(f"✅ API Key: {api_key[:10]}...")
+    print(f"✅ Network: {network}")
+    print(f"✅ XPUB: {xpub[:20]}...")
+    
+    # Crear agent
+    print("\n📦 Creant agent...")
+    try:
+        agent = BitcoinAIAgent(api_key)
+        agent.setup(xpub, network)
+        print("✅ Agent creat correctament!")
+    except Exception as e:
+        print(f"❌ Error creant agent: {e}")
+        return
+    
+    # Tests
+    test_queries = [
+        "Hola, qui ets?",
+        "Genera'm una adreça nova",
+        "Quin és el meu balanç?",
+        "Quines són les fees actuals?"
+    ]
+    
+    print("\n🧪 Executant tests...")
+    print("-" * 50)
+    
+    for query in test_queries:
+        print(f"\n💬 Pregunta: {query}")
+        try:
+            response = await agent.chat(query)
+            print(f"🤖 Resposta: {response}")
+        except Exception as e:
+            print(f"❌ Error: {e}")
+    
+    print("\n" + "=" * 50)
+    print("✅ TEST COMPLETAT")
+
+if __name__ == "__main__":
+    asyncio.run(test_agent())
