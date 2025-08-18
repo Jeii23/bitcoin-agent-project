@@ -50,6 +50,17 @@ from rich.panel import Panel
 from rich.prompt import Prompt
 from rich import print as rprint
 
+
+# Derivació d'adreces pròpia (usuari)
+try:
+    from address_derivation import derive_bitcoin_address  # usa el teu codi nou
+    CUSTOM_DERIVATION_AVAILABLE = True
+    print("[INFO] Derivació personalitzada disponible (derive_bitcoin_address)")
+except ImportError:
+    CUSTOM_DERIVATION_AVAILABLE = False
+    print("[WARNING] No s'ha trobat address_derivation.py; es farà servir el fallback")
+
+
 # ============== CONFIGURACIÓ ==============
 
 # Carregar variables del fitxer .env
@@ -87,41 +98,60 @@ class AgentState(TypedDict):
 
 # ============== UTILITATS PER DERIVACIÓ ==============
 
-def derive_real_address(xpub: str, network: str, index: int, change: bool = False) -> str:
-    """Deriva una adreça real des d'una XPUB/ZPUB usant HDWallet"""
-    
+def _fallback_fake_address(xpub: str, network: str, index: int, change: bool = False) -> str:
+    """Últim recurs: adreça fake determinística (com abans)."""
+    prefix = "tb1q" if network == "testnet" else "bc1q"
+    kind = "change" if change else "receive"
+    addr_hash = hashlib.sha256(f"{xpub}{kind}{index}".encode()).hexdigest()
+    return f"{prefix}{addr_hash[:39]}"
+
+def derive_address_and_path(xpub: str, network: str, index: int, change: bool = False) -> Dict:
+    """
+    Deriva adreça + path. Prioritza la teva derivació (derive_bitcoin_address).
+    Fallback: HDWallet simple (si el tens) i, si falla, adreça fake.
+    Retorna: {"address": str, "path": str}
+    """
+    # 1) Derivació personalitzada de l'usuari
+    if CUSTOM_DERIVATION_AVAILABLE:
+        try:
+            res = derive_bitcoin_address(xpub, index=index, change=change, network=network)
+            if res.get("success"):
+                return {"address": res["address"], "path": res.get("path", "")}
+            else:
+                print(f"[WARN] Derivació personalitzada ha fallat: {res.get('error')}")
+        except Exception as e:
+            print(f"[ERROR] Derivació personalitzada: {e}")
+
+    # 2) Fallback: HDWallet simple (el que ja feies)
     if HDWALLET_AVAILABLE:
         try:
-            from hdwallet import HDWallet
-            from hdwallet.cryptocurrencies import Bitcoin
-            
-            # Crear HDWallet amb Bitcoin
             hdwallet = HDWallet(cryptocurrency=Bitcoin)
-            
-            # Carregar la xpub/zpub
             hdwallet.from_xpublic_key(xpublic_key=xpub)
-            
-            # Determinar chain (0=receive, 1=change)
             chain = 1 if change else 0
-            
-            # Netejar i aplicar derivació
             hdwallet.clean_derivation()
             hdwallet.from_path(path=f"m/{chain}/{index}")
-            
-            # Obtenir adreça SegWit nativa
             address = hdwallet.p2wpkh_address()
-            
-            print(f"[DEBUG] ✅ Adreça derivada amb HDWallet: {address}")
-            return address
-            
+            # Path “orientatiu” BIP84 si no tenim el real
+            coin_type = "1'" if network == "testnet" else "0'"
+            path = f"m/84'/{coin_type}/0'/{chain}/{index}"
+            return {"address": address, "path": path}
         except Exception as e:
-            print(f"[ERROR] HDWallet: {e}")
-    
-    # Fallback a adreça fake si HDWallet no està disponible o falla
-    print("[WARNING] Usant adreça fake (no real)")
-    chain_str = "change" if change else "receive"
-    addr_hash = hashlib.sha256(f"{xpub}{chain_str}{index}".encode()).hexdigest()
-    return f"{'tb1q' if network == 'testnet' else 'bc1q'}{addr_hash[:39]}"
+            print(f"[ERROR] Fallback HDWallet: {e}")
+
+    # 3) Últim recurs: fake
+    fake = _fallback_fake_address(xpub, network, index, change)
+    coin_type = "1'" if network == "testnet" else "0'"
+    chain = 1 if change else 0
+    path = f"m/84'/{coin_type}/0'/{chain}/{index}"
+    return {"address": fake, "path": path}
+
+def derive_real_address(xpub: str, network: str, index: int, change: bool = False) -> str:
+    """
+    Manté la signatura antiga (per compatibilitat). Ara crida derive_address_and_path.
+    """
+    info = derive_address_and_path(xpub, network, index, change)
+    return info["address"]
+
 
 # ============== EINES (TOOLS) PER L'AGENT IA ==============
 
@@ -129,30 +159,20 @@ def derive_real_address(xpub: str, network: str, index: int, change: bool = Fals
 def get_balance(xpub: str, network: str = "testnet") -> Dict:
     """
     Obté el balanç d'una wallet Bitcoin desde la XPUB.
-    
-    Args:
-        xpub: Extended public key de la wallet
-        network: "mainnet" o "testnet"
     """
     try:
-        # Determinar coin type segons network
-        coin_type = "1'" if network == "testnet" else "0'"
-        
-        # Derivar adreces reals
         addresses = []
         for i in range(5):
-            address = derive_real_address(xpub, network, i, change=False)
+            info = derive_address_and_path(xpub, network, i, change=False)
             addresses.append({
-                "address": address,
-                "path": f"m/84'/{coin_type}/0'/0/{i}"
+                "address": info["address"],
+                "path": info["path"]
             })
-        
-        # Consultar UTXOs per cada adreça
+
         total_balance = 0
         total_utxos = 0
-        
         api_base = "https://blockstream.info/testnet/api" if network == "testnet" else "https://blockstream.info/api"
-        
+
         for addr_info in addresses:
             try:
                 response = requests.get(f"{api_base}/address/{addr_info['address']}/utxo", timeout=5)
@@ -163,9 +183,10 @@ def get_balance(xpub: str, network: str = "testnet") -> Dict:
                         total_utxos += 1
             except:
                 continue
-        
+
         btc_balance = total_balance / 100_000_000
-        
+        coin_type = "1'" if network == "testnet" else "0'"
+
         return {
             "success": True,
             "balance_btc": btc_balance,
@@ -175,73 +196,48 @@ def get_balance(xpub: str, network: str = "testnet") -> Dict:
             "first_address": addresses[0]["address"] if addresses else None,
             "network": network,
             "coin_type": coin_type,
-            "derivation_path_template": f"m/84'/{coin_type}/0'/0/n"
+            # No assumim 84': mostrem el path de cada adreça, i un template genèric només si cal
+            "derivation_paths": [a["path"] for a in addresses],
+            "derivation_path_template": "path segons prefix (44'/49'/84')"
         }
     except Exception as e:
-        return {
-            "success": False,
-            "error": str(e)
-        }
+        return {"success": False, "error": str(e)}
+
 
 @tool
 def generate_address(xpub: str, network: str = "testnet", index: int = 0) -> Dict:
     """
     Genera una nova adreça Bitcoin per rebre pagaments.
-    
-    Args:
-        xpub: Extended public key
-        network: "mainnet" o "testnet"
-        index: Index de l'adreça a generar
     """
     try:
-        # Derivar adreça real amb BIP32
-        address = derive_real_address(xpub, network, index, change=False)
-        
-        # Determinar coin type
+        info = derive_address_and_path(xpub, network, index, change=False)
         coin_type = "1'" if network == "testnet" else "0'"
-        
-        # Path HD correcte segons BIP84
-        hd_path = f"m/84'/{coin_type}/0'/0/{index}"
-        
+
         return {
             "success": True,
-            "address": address,
+            "address": info["address"],
             "index": index,
             "type": "receive",
             "network": network,
-            "path": hd_path,
+            "path": info["path"] or f"m/?'/{coin_type}/0'/0/{index}",
             "description": f"Adreça de recepció #{index} per {network}"
         }
     except Exception as e:
-        return {
-            "success": False,
-            "error": str(e)
-        }
+        return {"success": False, "error": str(e)}
+
 
 @tool
 def list_utxos(xpub: str, network: str = "testnet") -> Dict:
     """
     Llista totes les UTXOs (Unspent Transaction Outputs) disponibles.
-    
-    Args:
-        xpub: Extended public key
-        network: "mainnet" o "testnet"
     """
     try:
-        # Derivar adreces
-        addresses = []
-        for i in range(5):
-            addr_hash = hashlib.sha256(f"{xpub}{i}".encode()).hexdigest()
-            if network == "testnet":
-                address = f"tb1q{addr_hash[:39]}"
-            else:
-                address = f"bc1q{addr_hash[:39]}"
-            addresses.append(address)
-        
-        # Obtenir UTXOs
+        # Derivar les primeres 5 adreces de recepció reals
+        addresses = [derive_real_address(xpub, network, i, change=False) for i in range(5)]
+
         all_utxos = []
         api_base = "https://blockstream.info/testnet/api" if network == "testnet" else "https://blockstream.info/api"
-        
+
         for address in addresses:
             try:
                 response = requests.get(f"{api_base}/address/{address}/utxo", timeout=5)
@@ -258,7 +254,7 @@ def list_utxos(xpub: str, network: str = "testnet") -> Dict:
                         })
             except:
                 continue
-        
+
         return {
             "success": True,
             "utxos": all_utxos,
@@ -267,10 +263,7 @@ def list_utxos(xpub: str, network: str = "testnet") -> Dict:
             "total_value_btc": sum(u["value_satoshis"] for u in all_utxos) / 100_000_000
         }
     except Exception as e:
-        return {
-            "success": False,
-            "error": str(e)
-        }
+        return {"success": False, "error": str(e)}
 
 @tool
 def get_fee_rates(network: str = "testnet") -> Dict:
@@ -379,16 +372,17 @@ def create_transaction(
         }
         
         if change > 546:  # Dust limit
-            # Generar adreça de canvi (change = 1 en el path)
-            change_addr_hash = hashlib.sha256(f"{xpub}change0".encode()).hexdigest()
-            change_address = f"tb1q{change_addr_hash[:39]}" if network == "testnet" else f"bc1q{change_addr_hash[:39]}"
-            
+            # Generar adreça de canvi real (change = True)
+            change_info = derive_address_and_path(xpub, network, index=0, change=True)
+            change_address = change_info["address"]
+
             psbt["outputs"].append({
                 "address": change_address,
                 "value": change,
                 "type": "change",
-                "path": f"m/84'/{coin_type}/0'/1/0"  # Change path (1 en lloc de 0)
+                "path": change_info["path"] or "m/.../1/0"
             })
+
         
         return {
             "success": True,
