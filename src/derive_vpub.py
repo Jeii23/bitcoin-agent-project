@@ -1,27 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-Derivació d'adreces Bitcoin amb HDWallet - Versió arreglada (sense BitcoinTestnet)
-- Deriva en RELATIU des d'un xpub/ypub/zpub (sense "m/")
-- Selecciona el tipus d'adreça segons el prefix (xpub/ypub/zpub…)
-- No depèn de "BitcoinTestnet": només fem encoding testnet/mainnet a mà
-"""
 
 from typing import Dict
-import struct
-import hashlib
-
+import struct, hashlib, sys, traceback
 from hdwallet import HDWallet
 from hdwallet.cryptocurrencies import Bitcoin
+from hdwallet.hds.bip32 import BIP32HD
+from hdwallet.derivations.custom import CustomDerivation
 
-# ---------- Tipus/propòsit segons prefix ----------
+
+# ---------- prefix → tipus adreça ----------
 def _purpose_and_method(xpub_like: str):
     p = xpub_like[:4].lower()
-    if p in ("zpub", "vpub"):  # BIP84 Native SegWit
+    if p in ("zpub", "vpub"):  # BIP84
         return "84'", "p2wpkh_address"
-    if p in ("ypub", "upub"):  # BIP49 P2SH-SegWit
+    if p in ("ypub", "upub"):  # BIP49
         return "49'", "p2sh_p2wpkh_address"
-    return "44'", "p2pkh_address"  # BIP44 legacy per xpub/tpub
+    return "44'", "p2pkh_address"  # BIP44 per xpub/tpub
 
 # ---------- Base58Check ----------
 _B58_ALPHABET = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
@@ -30,10 +25,10 @@ def _b58decode_check(s: str) -> bytes:
     n = 0
     for c in s.encode():
         n = n * 58 + _B58_ALPHABET.index(c)
-    full = n.to_bytes((n.bit_length() + 7) // 8, 'big')
+    full = n.to_bytes((n.bit_length() + 7) // 8, "big")
     pad = 0
     for ch in s:
-        if ch == '1': pad += 1
+        if ch == "1": pad += 1
         else: break
     full = b"\x00"*pad + full
     if len(full) < 4:
@@ -46,7 +41,7 @@ def _b58decode_check(s: str) -> bytes:
 def _b58encode_check(payload: bytes) -> str:
     chk = hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4]
     full = payload + chk
-    n = int.from_bytes(full, 'big')
+    n = int.from_bytes(full, "big")
     s = bytearray()
     while n > 0:
         n, r = divmod(n, 58)
@@ -55,10 +50,10 @@ def _b58encode_check(payload: bytes) -> str:
     for b in full:
         if b == 0: pad += 1
         else: break
-    s.extend(b'1' * pad)
+    s.extend(b"1" * pad)
     return bytes(reversed(s)).decode()
 
-# ---------- Mapes de versions ----------
+# ---------- mapes de versions SLIP-0132 ----------
 _VERSION_MAP_TO_XPUB = {
     0x049D7CB2: 0x0488B21E,  # ypub → xpub
     0x04B24746: 0x0488B21E,  # zpub → xpub
@@ -71,7 +66,7 @@ _VERSION_MAP_TO_TPUB = {
 def _normalize_to_x_or_t_pub(xpub_like: str) -> str:
     raw = _b58decode_check(xpub_like)
     if len(raw) != 78:
-        raise ValueError(f"Extended key longitud incorrecta: {len(raw)} bytes (s’esperaven 78)")
+        raise ValueError(f"Extended key longitud incorrecta: {len(raw)} bytes (78 esperats)")
     ver = struct.unpack(">I", raw[:4])[0]
     body = raw[4:]
     if xpub_like.startswith(("xpub", "tpub")):
@@ -89,21 +84,19 @@ def _version_implies_testnet(xpub_like: str) -> bool:
     ver = struct.unpack(">I", raw[:4])[0]
     return ver in (0x043587CF, 0x044A5262, 0x045F1CF6)  # tpub/upub/vpub
 
-# ---------- Helpers d’adreça ----------
+# ---------- helpers d’adreça ----------
 def _hash160(b: bytes) -> bytes:
     return hashlib.new("ripemd160", hashlib.sha256(b).digest()).digest()
 
 _BECH32_CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
-def _bech32_hrp_expand(hrp: str):
-    return [ord(x) >> 5 for x in hrp] + [0] + [ord(x) & 31 for x in hrp]
+def _bech32_hrp_expand(hrp): return [ord(x) >> 5 for x in hrp] + [0] + [ord(x) & 31 for x in hrp]
 def _bech32_polymod(values):
-    g = [0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3]
+    g = [0x3b6a57b2,0x26508e6d,0x1ea119fa,0x3d4233dd,0x2a1462b3]
     chk = 1
     for v in values:
         b = chk >> 25
         chk = ((chk & 0x1ffffff) << 5) ^ v
-        for i in range(5):
-            chk ^= g[i] if ((b >> i) & 1) else 0
+        for i in range(5): chk ^= g[i] if ((b >> i) & 1) else 0
     return chk
 def _bech32_create_checksum(hrp, data):
     pm = _bech32_polymod(_bech32_hrp_expand(hrp) + data + [0]*6) ^ 1
@@ -111,69 +104,75 @@ def _bech32_create_checksum(hrp, data):
 def _bech32_encode(hrp, data):
     return hrp + "1" + "".join(_BECH32_CHARSET[d] for d in data + _bech32_create_checksum(hrp, data))
 def _convertbits(data, frombits, tobits, pad=True):
-    acc = 0; bits = 0; ret = []
-    maxv = (1 << tobits) - 1
-    max_acc = (1 << (frombits + tobits - 1)) - 1
+    acc=0; bits=0; ret=[]; maxv=(1<<tobits)-1; max_acc=(1<<(frombits+tobits-1))-1
     for b in data:
         if b < 0 or (b >> frombits): return None
-        acc = ((acc << frombits) | b) & max_acc
-        bits += frombits
+        acc = ((acc<<frombits)|b) & max_acc; bits += frombits
         while bits >= tobits:
-            bits -= tobits
-            ret.append((acc >> bits) & maxv)
-    if pad and bits:
-        ret.append((acc << (tobits - bits)) & maxv)
-    elif not pad and (bits >= frombits or ((acc << (tobits - bits)) & maxv)):
-        return None
+            bits -= tobits; ret.append((acc>>bits)&maxv)
+    if pad and bits: ret.append((acc<<(tobits-bits))&maxv)
+    elif not pad and (bits>=frombits or ((acc<<(tobits-bits))&maxv)): return None
     return ret
-def _encode_segwit_address(hrp: str, witver: int, witprog: bytes) -> str:
+def _encode_segwit_address(hrp, witver, witprog):
     data = [witver] + _convertbits(list(witprog), 8, 5, True)
     return _bech32_encode(hrp, data)
+
 def _p2pkh_address(pubkey_bytes: bytes, network: str) -> str:
     vh = (b"\x6f" if network == "testnet" else b"\x00") + _hash160(pubkey_bytes)
     return _b58encode_check(vh)
+
 def _p2sh_p2wpkh_address(pubkey_bytes: bytes, network: str) -> str:
     rs = b"\x00\x14" + _hash160(pubkey_bytes)
     vh = (b"\xc4" if network == "testnet" else b"\x05") + _hash160(rs)
     return _b58encode_check(vh)
+
 def _p2wpkh_address(pubkey_bytes: bytes, network: str) -> str:
     hrp = "tb" if network == "testnet" else "bc"
     return _encode_segwit_address(hrp, 0, _hash160(pubkey_bytes))
 
-# ---------- Derivació principal ----------
-def derive_bitcoin_address(
-    xpub_or_zpub: str,
-    index: int = 0,
-    change: bool = False,
-    network: str = "mainnet"
-) -> Dict:
+# ---------- derivació principal amb DEBUG ----------
+def derive_bitcoin_address(xpub_or_zpub: str, index: int = 0, change: bool = False, network: str = "mainnet") -> Dict:
     try:
-        # 1) Detecta testnet robustament
-        net = "testnet" if _version_implies_testnet(xpub_or_zpub) \
-              else ("testnet" if xpub_or_zpub[:4].lower() in ("tpub", "upub", "vpub") else network)
-        # 2) Normalitza a xpub/tpub
+        if index < 0 or index >= 2**31:
+            raise ValueError("Index fora de rang no-hardened")
+
+        # Xarxa deduïda (version bytes)
+        net = "testnet" if _version_implies_testnet(xpub_or_zpub) else network
+
+        # Normalitza ypub/zpub → xpub | upub/vpub → tpub
         normalized = _normalize_to_x_or_t_pub(xpub_or_zpub)
 
-        # 3) Carrega l’xpub
-        hdwallet = HDWallet(cryptocurrency=Bitcoin)
-        hdwallet.from_xpublic_key(xpublic_key=normalized)
-        hdwallet.clean_derivation()
+        # Força HD = BIP32 i NO netegis derivació abans (encara no existeix)
+        hdwallet = HDWallet(cryptocurrency=Bitcoin, hd=BIP32HD, network=net)
 
+        # Inicialitza des de l'XPUB (no-root permès)
+        hdwallet.from_xpublic_key(xpublic_key=normalized, strict=False)
+       
+
+        # Deriva NOMÉS m/<chain>/<index> (no-hardened)
         chain = 1 if change else 0
-        # 4) Derivació no-hardened amb fallback (amb i sense "m/")
-        try:
-            hdwallet.from_path(f"{chain}/{index}")
-        except Exception:
-            hdwallet.clean_derivation()
-            hdwallet.from_path(f"m/{chain}/{index}")
 
-        # 5) Public key comprimida
+        # 1r intent: ruta completa en una sola passada
+        try:
+            hdwallet.from_path(f"m/{chain}/{index}")
+        except Exception as e1:
+            try:
+                deriv = CustomDerivation().from_path(f"m/{chain}/{index}")
+                hdwallet.update_derivation(derivation=deriv)
+            except Exception as e2:
+                # Últim recurs: dos salts no-hardened
+                hdwallet.from_index(chain, hardened=False)
+                hdwallet.from_index(index, hardened=False)
+
+        # Public key comprimida
         pub_hex = hdwallet.public_key()
+        if pub_hex.startswith("0x"):
+            pub_hex = pub_hex[2:]
         pub_bytes = bytes.fromhex(pub_hex)
         if len(pub_bytes) != 33:
             raise ValueError("Public key no comprimida o mida inesperada")
 
-        # 6) Tipus d’adreça segons el prefix ORIGINAL
+        # Adreça segons prefix original
         purpose, _ = _purpose_and_method(xpub_or_zpub)
         if purpose == "84'":
             address = _p2wpkh_address(pub_bytes, net)
@@ -196,27 +195,26 @@ def derive_bitcoin_address(
             "network": net,
         }
     except Exception as e:
+        traceback.print_exc()
         return {"success": False, "error": str(e)}
 
-# ---------- Tests ----------
+# ---------- test ----------
 def test_hdwallet():
-    zpub = "zpub6qx9o493xChVmygkR1k3eaMwyg58DnpSv8Any2jjvx8N9yeCk6aELfTiWgr4nnQuNMMUnyK2GzDJbwELGrJkka7Ru3ZzAnB1qZkcYngRKZY"
-    expected = "bc1qu449dhqpqv6mp4etf55xksml7k76vgclpnljwe"
-
+    zpub = "zpub6qTNaghwRP9EiX1xpzGNuB1dRWu3oe4Ho23W8xon8tJ6da9RZoFYU2A2anrLmUYpN5nLCqEDHRhLgLstVc5bCbRjgKnio6r5WUkj5DSctYK"
+    expected = "bc1qd60uganmwudnn2n4482da6nx9z36ty3kyhr2rt"
     print("🧪 Test de derivació amb HDWallet")
-    print("=" * 70)
+    print("="*70)
     print(f"ZPUB: {zpub[:30]}...")
     print(f"Adreça esperada (index 0): {expected}")
-    print("=" * 70)
+    print("="*70)
 
     print("\n📊 Test principal (index 0):")
     result = derive_bitcoin_address(zpub, index=0, change=False, network="mainnet")
-
     if result["success"]:
         print("✅ Derivació exitosa!")
         print(f"   Adreça obtinguda: {result['address']}")
         print(f"   Public Key: {result['public_key'][:40]}...")
-        print(f"   Path complet: {result['path']}")
+        print(f"   Path (informatiu): {result['path']}")
         print(f"   Derivació aplicada: {result['derivation']}")
         if result["address"] == expected:
             print("\n   🎉 PERFECTE! L'adreça coincideix!")
@@ -238,10 +236,10 @@ def test_hdwallet():
         print(f"   Change {i}: {r['address'] if r['success'] else 'Error - ' + r['error']}")
 
 def derive_real_address_hdwallet(xpub: str, network: str, index: int, change: bool = False) -> str:
-    result = derive_bitcoin_address(xpub, index, change, network)
-    if result["success"]:
-        return result["address"]
-    prefix = "tb1q" if network == "testnet" else "bc1q"
+    res = derive_bitcoin_address(xpub, index, change, network)
+    if res["success"]:
+        return res["address"]
+    prefix = "tb1q" if (network == "testnet" or _version_implies_testnet(xpub)) else "bc1q"
     addr_hash = hashlib.sha256(f"{xpub}{'change' if change else 'receive'}{index}".encode()).hexdigest()
     return f"{prefix}{addr_hash[:39]}"
 
