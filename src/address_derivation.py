@@ -19,24 +19,60 @@ def _purpose_and_method(xpub_like: str):
     return "44'", "p2pkh_address"  # BIP44 per xpub/tpub
 
 # ---------- Base58Check ----------
+try:
+    import base58  # pip install base58
+    _HAS_BASE58 = True
+except Exception:
+    base58 = None
+    _HAS_BASE58 = False
+
+# Assegura't de tenir (o conservar) aquest alfabet:
 _B58_ALPHABET = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+_B58_INDEX = {c: i for i, c in enumerate(_B58_ALPHABET)}
+
 
 def _b58decode_check(s: str) -> bytes:
-    n = 0
-    for c in s.encode():
-        n = n * 58 + _B58_ALPHABET.index(c)
-    full = n.to_bytes((n.bit_length() + 7) // 8, "big")
+    """
+    Decodifica Base58Check i retorna el payload (sense el checksum de 4 bytes).
+    Si hi ha la llibreria `base58`, la fem servir; sinó, manual fallback.
+    """
+    # 1) Prova amb la llibreria si està disponible
+    if _HAS_BASE58:
+        try:
+            return base58.b58decode_check(s)
+        except Exception as e:
+            # Mantén el mateix missatge que espera el codi existent
+            raise ValueError("Base58 checksum invalid") from e
+
+    # 2) Fallback manual (sense dependències)
+    if not s:
+        raise ValueError("Empty Base58 string")
+
+    num = 0
     pad = 0
-    for ch in s:
-        if ch == "1": pad += 1
-        else: break
-    full = b"\x00"*pad + full
-    if len(full) < 4:
-        raise ValueError("Base58: massa curt")
-    payload, checksum = full[:-4], full[-4:]
-    if hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4] != checksum:
+    # compta els '1' inicials (bytes 0x00)
+    for ch in s.encode():
+        if ch == ord("1") and num == 0:
+            pad += 1
+            continue
+        try:
+            num = num * 58 + _B58_INDEX[ch]
+        except KeyError:
+            raise ValueError(f"Invalid Base58 character: {chr(ch)!r}")
+
+    # passa a bytes i afegeix el padding dels '1' inicials
+    body = num.to_bytes((num.bit_length() + 7) // 8, "big") or b"\x00"
+    decoded = (b"\x00" * pad) + body
+
+    if len(decoded) < 5:
+        raise ValueError("Base58 too short")
+
+    payload, checksum = decoded[:-4], decoded[-4:]
+    expected = hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4]
+    if checksum != expected:
         raise ValueError("Base58 checksum invalid")
     return payload
+
 
 def _b58encode_check(payload: bytes) -> str:
     chk = hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4]

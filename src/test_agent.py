@@ -26,7 +26,7 @@ async def test_agent():
     
     # Obtenir configuració
     api_key = os.getenv("OPENAI_API_KEY")
-    xpub = os.getenv("BITCOIN_XPUB", "tpubD6NzVbkrYhZ4XgiXtFtukm3UvC3J3qTtmqYe2HhLUfRr7dW3JQgFVPuTqCvmKPNBPidLhPXF5ibXXrBhKBpvPyrqsQQcz8MJjwVwqkqqu3y")
+    xpub = os.getenv("BITCOIN_XPUB", "zpub6qke5yCyxfwrc5ztdBnykfd36EAMGaRtNwoEob2MQd9cQCesyPD9mjMM6dZk4kpgEJxniwK6jbuzokVQ2cvBQv5qNWDRaRWDhfJykWPE2SB")
     network = os.getenv("BITCOIN_NETWORK", "testnet")
     
     if not api_key or api_key == "your-key-here":
