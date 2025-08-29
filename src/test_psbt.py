@@ -65,7 +65,7 @@ class PSBTTester:
         self.creator = PSBTCreator(network="testnet")
         self.test_results = []
         # Usar una XPUB vàlida diferent per tests (aquesta és una XPUB testnet vàlida coneguda)
-        self.xpub = "zpub6qke5yCyxfwrc5ztdBnykfd36EAMGaRtNwoEob2MQd9cQCesyPD9mjMM6dZk4kpgEJxniwK6jbuzokVQ2cvBQv5qNWDRaRWDhfJykWPE2SB"
+        self.xpub = "vpub5Zs16Jexbgj86exZZdj2LT3ukA2gPXdGgdLZokbng1MgbP5jrm8eRkqAffKEJN2BnMzjkJ3G64Sk2XoB6FyAEnXAfmu7nthCGFXy1snAQHC"
         
         # UTXOs de test simulades amb adreces vàlides
         self.test_utxos = [
@@ -73,14 +73,14 @@ class PSBTTester:
                 "txid": "a" * 64,
                 "vout": 0,
                 "value_satoshis": 100000,
-                "address": "bc1q2pqp8zmdakr27c3delx5d5k39c4u7c27tqp4tv",  # Adreça Bech32 vàlida
+                "address": "tb1q0wwa08elht6gq8uzjsl66mdhjl7rcsetakcf4t",  # Adreça Bech32 vàlida
                 "confirmations": 10
             },
             {
                 "txid": "b" * 64,
                 "vout": 1,
                 "value_satoshis": 50000,
-                "address": "tb1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3q0sl5k7",  # Adreça Bech32 vàlida
+                "address": "tb1qfqzk956wtxlvvghewk5hqu6vwqjtjm5qmua7wx",  # Adreça Bech32 vàlida
                 "confirmations": 5
             },
             {
@@ -99,7 +99,7 @@ class PSBTTester:
             psbt = self.creator.create_psbt(
                 inputs=[self.test_utxos[0]],
                 outputs=[
-                    {"address": "bc1q2pqp8zmdakr27c3delx5d5k39c4u7c27tqp4tv", "value": 90000}
+                    {"address": "tb1q0wwa08elht6gq8uzjsl66mdhjl7rcsetakcf4t", "value": 90000}
                 ]
             )
             
@@ -125,9 +125,9 @@ class PSBTTester:
             psbt = self.creator.create_psbt(
                 inputs=self.test_utxos[:2],  # 2 inputs
                 outputs=[
-                    {"address": "bc1q2pqp8zmdakr27c3delx5d5k39c4u7c27tqp4tv", "value": 60000},
+                    {"address": "tb1q0wwa08elht6gq8uzjsl66mdhjl7rcsetakcf4t", "value": 60000},
                     {"address": "2MzQwSSnBHWHqSAqtTVQ6v47XtaisrJa1Vc", "value": 30000},
-                    {"address": "tb1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3q0sl5k7", "value": 9000}
+                    {"address": "tb1qfqzk956wtxlvvghewk5hqu6vwqjtjm5qmua7wx", "value": 9000}
                 ]
             )
             
@@ -147,9 +147,9 @@ class PSBTTester:
         """Test 3: Decodificació d'adreces"""
         test_addresses = [
             # Bech32 (P2WPKH) - adreces reals vàlides
-            {"addr": "bc1q2pqp8zmdakr27c3delx5d5k39c4u7c27tqp4tv", "type": "Bech32"},
+            {"addr": "tb1q0wwa08elht6gq8uzjsl66mdhjl7rcsetakcf4t", "type": "Bech32"},
             # P2SH (testnet) - adreça real vàlida
-            {"addr": "2MzQwSSnBHWHqSAqtTVQ6v47XtaisrJa1Vc", "type": "P2SH"}
+            {"addr": "tb1q0wwa08elht6gq8uzjsl66mdhjl7rcsetakcf4t", "type": "P2SH"}
         ]
         
         all_passed = True
@@ -173,11 +173,11 @@ class PSBTTester:
         try:
             result = create_transaction_psbt(
                 xpub=self.xpub,
-                recipient_address="bc1q2pqp8zmdakr27c3delx5d5k39c4u7c27tqp4tv",
+                recipient_address="tb1q0wwa08elht6gq8uzjsl66mdhjl7rcsetakcf4t",
                 amount_btc=0.001,
                 utxos=self.test_utxos,
                 fee_satoshis=1000,
-                change_address="2MzQwSSnBHWHqSAqtTVQ6v47XtaisrJa1Vc",  # Adreça vàlida per change
+                change_address="tb1qfqzk956wtxlvvghewk5hqu6vwqjtjm5qmua7wx",  # Adreça vàlida per change
                 network="testnet"
             )
             
@@ -213,7 +213,7 @@ class PSBTTester:
             # Intentar enviar més del que tenim
             result = create_transaction_psbt(
                 xpub=self.xpub,
-                recipient_address="bc1q2pqp8zmdakr27c3delx5d5k39c4u7c27tqp4tv",
+                recipient_address="tb1q0wwa08elht6gq8uzjsl66mdhjl7rcsetakcf4t",
                 amount_btc=10.0,  # Molt més del que tenim en UTXOs
                 utxos=self.test_utxos,
                 fee_satoshis=1000,
@@ -241,7 +241,7 @@ class PSBTTester:
             # Crear transacció que deixa canvi sota el dust limit
             result = create_transaction_psbt(
                 xpub=self.xpub,
-                recipient_address="bc1q2pqp8zmdakr27c3delx5d5k39c4u7c27tqp4tv",
+                recipient_address="tb1q0wwa08elht6gq8uzjsl66mdhjl7rcsetakcf4t",
                 amount_btc=0.000994,  # Deixa ~500 satoshis de canvi (sota 546 dust limit)
                 utxos=[self.test_utxos[0]],  # 100000 satoshis
                 fee_satoshis=100,
@@ -270,7 +270,7 @@ class PSBTTester:
             # Primer crear un PSBT amb adreça vàlida
             psbt = self.creator.create_psbt(
                 inputs=[self.test_utxos[0]],
-                outputs=[{"address": "bc1q2pqp8zmdakr27c3delx5d5k39c4u7c27tqp4tv", "value": 90000}]
+                outputs=[{"address": "tb1q0wwa08elht6gq8uzjsl66mdhjl7rcsetakcf4t", "value": 90000}]
             )
             
             # Després decodificar-lo
@@ -300,11 +300,11 @@ class PSBTTester:
             for case in test_cases:
                 result = create_transaction_psbt(
                     xpub=self.xpub,
-                    recipient_address="bc1q2pqp8zmdakr27c3delx5d5k39c4u7c27tqp4tv",
+                    recipient_address="tb1q0wwa08elht6gq8uzjsl66mdhjl7rcsetakcf4t",
                     amount_btc=0.0001,
                     utxos=self.test_utxos[:case["inputs"]],
                     fee_satoshis=case["fee"],
-                    change_address="2MzQwSSnBHWHqSAqtTVQ6v47XtaisrJa1Vc",
+                    change_address="tb1q0wwa08elht6gq8uzjsl66mdhjl7rcsetakcf4t",
                     network="testnet"
                 )
                 
@@ -332,12 +332,12 @@ class PSBTTester:
         """Test 9: Generació d'adreça de canvi"""
         try:
             # Usar una adreça de canvi vàlida coneguda
-            change_address = "2MzQwSSnBHWHqSAqtTVQ6v47XtaisrJa1Vc"
+            change_address = "tb1q0wwa08elht6gq8uzjsl66mdhjl7rcsetakcf4t"
             
             # Crear transacció amb adreça de canvi
             result = create_transaction_psbt(
                 xpub=self.xpub,
-                recipient_address="bc1q2pqp8zmdakr27c3delx5d5k39c4u7c27tqp4tv",
+                recipient_address="tb1q0wwa08elht6gq8uzjsl66mdhjl7rcsetakcf4t",
                 amount_btc=0.0005,
                 utxos=[self.test_utxos[0]],
                 fee_satoshis=1000,
@@ -469,12 +469,12 @@ async def test_integration_with_agent():
         
         # Crear agent
         agent = BitcoinAIAgent(api_key)
-        xpub = "zpub6qx9o493xChVmygkR1k3eaMwyg58DnpSv8Any2jjvx8N9yeCk6aELfTiWgr4nnQuNMMUnyK2GzDJbwELGrJkka7Ru3ZzAnB1qZkcYngRKZY"
-        agent.setup(xpub, "mainnet")
+        xpub = "vpub5Zs16Jexbgj86exZZdj2LT3ukA2gPXdGgdLZokbng1MgbP5jrm8eRkqAffKEJN2BnMzjkJ3G64Sk2XoB6FyAEnXAfmu7nthCGFXy1snAQHC"
+        agent.setup(xpub, "testnet")
         
         # Test query
         print(f"\n{Colors.CYAN}Provant crear una transacció amb l'agent...{Colors.END}")
-        response = await agent.chat("Vull crear una transacció per enviar 0.001 BTC a bc1q2pqp8zmdakr27c3delx5d5k39c4u7c27tqp4tv")
+        response = await agent.chat("Vull crear una transacció per enviar 0.001 BTC a tb1qfqzk956wtxlvvghewk5hqu6vwqjtjm5qmua7wx")
         
         print(f"\n{Colors.GREEN}Resposta de l'agent:{Colors.END}")
         print(response)

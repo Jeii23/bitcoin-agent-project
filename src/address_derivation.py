@@ -236,8 +236,8 @@ def derive_bitcoin_address(xpub_or_zpub: str, index: int = 0, change: bool = Fal
 
 # ---------- test ----------
 def test_hdwallet():
-    zpub = "zpub6qTNaghwRP9EiX1xpzGNuB1dRWu3oe4Ho23W8xon8tJ6da9RZoFYU2A2anrLmUYpN5nLCqEDHRhLgLstVc5bCbRjgKnio6r5WUkj5DSctYK"
-    expected = "bc1qd60uganmwudnn2n4482da6nx9z36ty3kyhr2rt"
+    zpub = "vpub5Zs16Jexbgj86exZZdj2LT3ukA2gPXdGgdLZokbng1MgbP5jrm8eRkqAffKEJN2BnMzjkJ3G64Sk2XoB6FyAEnXAfmu7nthCGFXy1snAQHC"
+    expected = "tb1q0wwa08elht6gq8uzjsl66mdhjl7rcsetakcf4t"
     print("🧪 Test de derivació amb HDWallet")
     print("="*70)
     print(f"ZPUB: {zpub[:30]}...")
@@ -263,12 +263,12 @@ def test_hdwallet():
 
     print("\n📦 Altres adreces de recepció:")
     for i in range(1, 5):
-        r = derive_bitcoin_address(zpub, index=i, change=False, network="mainnet")
+        r = derive_bitcoin_address(zpub, index=i, change=False, network="testnet")
         print(f"   Index {i}: {r['address'] if r['success'] else 'Error - ' + r['error']}")
 
     print("\n💱 Adreces de canvi:")
     for i in range(0, 3):
-        r = derive_bitcoin_address(zpub, index=i, change=True, network="mainnet")
+        r = derive_bitcoin_address(zpub, index=i, change=True, network="testnet")
         print(f"   Change {i}: {r['address'] if r['success'] else 'Error - ' + r['error']}")
 
 def derive_real_address_hdwallet(xpub: str, network: str, index: int, change: bool = False) -> str:
