@@ -83,6 +83,39 @@ if not OPENAI_API_KEY or OPENAI_API_KEY == "your-key-here":
 if DEFAULT_NETWORK not in ["mainnet", "testnet"]:
     DEFAULT_NETWORK = "testnet"
 
+    # ============== HELPER ==============
+
+
+def _address_has_history(address: str, network: str) -> bool:
+    """
+    Retorna True si l'adreça ha tingut algun UTXO (encara que ja estigui gastat).
+    Usa l'endpoint /address per mirar funded_txo_count (chain+mempool).
+    """
+    api_base = "https://blockstream.info/testnet/api" if network == "testnet" else "https://blockstream.info/api"
+    try:
+        r = requests.get(f"{api_base}/address/{address}", timeout=8)
+        if r.status_code != 200:
+            # Fallback suau: si l'endpoint principal falla, prova /utxo (NO detecta ús històric gastat)
+            r2 = requests.get(f"{api_base}/address/{address}/utxo", timeout=5)
+            if r2.status_code == 200:
+                utxos = r2.json()
+                return len(utxos) > 0
+            return False
+
+        info = r.json() or {}
+        chain = info.get("chain_stats", {}) or {}
+        memp = info.get("mempool_stats", {}) or {}
+        funded = chain.get("funded_txo_count", 0) + memp.get("funded_txo_count", 0)
+        # Alternativament es pot mirar tx_count, però funded_txo_count és més específic
+        return funded > 0
+    except Exception:
+        # En cas d'error de xarxa, millor ser conservador i considerar-la com a "usada"
+        # per evitar reusar sense voler una adreça que ja va rebre fons.
+        return True
+
+
+
+
 # ============== ESTAT DE L'AGENT ==============
 
 class AgentState(TypedDict):
@@ -115,10 +148,18 @@ def derive_address_and_path(xpub: str, network: str, index: int, change: bool = 
             print(f"[ERROR] Derivació personalitzada: {e}")
 
     # 2) Fallback: HDWallet simple
+    # 2) Fallback: HDWallet simple
     if HDWALLET_AVAILABLE:
         try:
+            # ✨ NORMALITZA SLIP-132 (vpub/upub → tpub ; zpub/ypub → xpub)
+            try:
+                from address_derivation import _normalize_to_x_or_t_pub as _norm
+                normalized = _norm(xpub)
+            except Exception:
+                normalized = xpub  # si no hi ha helper, prova igual
+
             hdwallet = HDWallet(cryptocurrency=Bitcoin)
-            hdwallet.from_xpublic_key(xpublic_key=xpub)
+            hdwallet.from_xpublic_key(xpublic_key=normalized, strict=False)
             chain = 1 if change else 0
             hdwallet.clean_derivation()
             hdwallet.from_path(path=f"m/{chain}/{index}")
@@ -153,12 +194,16 @@ def get_balance(xpub: str, network: str = "testnet") -> Dict:
     """
     try:
         addresses = []
-        for i in range(5):
-            info = derive_address_and_path(xpub, network, i, change=False)
-            addresses.append({
-                "address": info["address"],
-                "path": info["path"]
-            })
+        for chain_is_change in (False, True):  # False=receive (m/.../0/i), True=change (m/.../1/i)
+            for i in range(10):  # p.ex. 10 per cada chain
+                info = derive_address_and_path(xpub, network, i, change=chain_is_change)
+                addresses.append({
+                    "address": info["address"],
+                    "path": info["path"],
+                    "change": chain_is_change,
+                    "index": i,
+                })
+
 
         total_balance = 0
         total_utxos = 0
@@ -183,6 +228,7 @@ def get_balance(xpub: str, network: str = "testnet") -> Dict:
             "balance_btc": btc_balance,
             "balance_satoshis": total_balance,
             "total_utxos": total_utxos,
+            "addresses": addresses,            # llista completa (adreça+path+chain+index)
             "addresses_checked": len(addresses),
             "first_address": addresses[0]["address"] if addresses else None,
             "network": network,
@@ -194,25 +240,57 @@ def get_balance(xpub: str, network: str = "testnet") -> Dict:
         return {"success": False, "error": str(e)}
 
 @tool
-def generate_address(xpub: str, network: str = "testnet", index: int = 0) -> Dict:
+def generate_address(xpub: str, network: str = "testnet", index: int = 0, require_unused: bool = True, max_scan: int = 200) -> Dict:
     """
-    Genera una nova adreça Bitcoin per rebre pagaments.
+    Genera una adreça de recepció. Per defecte, escaneja des de `index`
+    fins trobar la primera adreça SENSE ús (cap funded_txo, gastat o no).
+    - require_unused=True: obliga que l'adreça no tingui historial
+    - max_scan: límit de seguretat per no escanejar infinitament
     """
     try:
-        info = derive_address_and_path(xpub, network, index, change=False)
         coin_type = "1'" if network == "testnet" else "0'"
 
+        # Si no exigim "unused", manté el comportament antic
+        if not require_unused:
+            info = derive_address_and_path(xpub, network, index, change=False)
+            return {
+                "success": True,
+                "address": info["address"],
+                "index": index,
+                "type": "receive",
+                "network": network,
+                "path": info["path"] or f"m/84'/{coin_type}/0'/0/{index}",
+                "description": f"Adreça de recepció #{index} per {network}"
+            }
+
+        # 🔎 Cerca la primera adreça sense historial (m/.../0/i)
+        tested = []
+        for i in range(index, index + max_scan):
+            info = derive_address_and_path(xpub, network, i, change=False)
+            addr = info["address"]
+            used = _address_has_history(addr, network)
+            tested.append({"index": i, "address": addr, "used": used})
+            if not used:
+                return {
+                    "success": True,
+                    "address": addr,
+                    "index": i,
+                    "type": "receive",
+                    "network": network,
+                    "path": info["path"] or f"m/84'/{coin_type}/0'/0/{i}",
+                    "description": f"Adreça de recepció (primera sense ús) #{i} per {network}",
+                    "checked": tested  # opcional: útil per debugging
+                }
+
         return {
-            "success": True,
-            "address": info["address"],
-            "index": index,
-            "type": "receive",
-            "network": network,
-            "path": info["path"] or f"m/?'/{coin_type}/0'/0/{index}",
-            "description": f"Adreça de recepció #{index} per {network}"
+            "success": False,
+            "error": f"No s'ha trobat cap adreça sense ús en {max_scan} intents a partir de l'índex {index} (m/.../0/i).",
+            "checked": tested
         }
+
     except Exception as e:
         return {"success": False, "error": str(e)}
+
 
 @tool
 def list_utxos(xpub: str, network: str = "testnet") -> Dict:

@@ -50,8 +50,8 @@ async def test_agent():
     # Tests
     test_queries = [
         "Hola, qui ets?",
-        "Genera'm una adreça nova",
-        "Quin és el meu balanç?",
+        "Genera'm una adreça nova que no hagi fet servir",
+        "Quin és el meu balanç? i diguem totes les adreçes que has comprobat",
         "Quines són les fees actuals?"
     ]
     

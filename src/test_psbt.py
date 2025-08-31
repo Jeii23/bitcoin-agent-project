@@ -10,6 +10,7 @@ import sys
 from pathlib import Path
 from decimal import Decimal
 from typing import Dict, List
+from bitcoin_ai_agent import derive_address_and_path 
 
 # Afegir el directori actual al path
 sys.path.append(str(Path(__file__).parent))
@@ -91,6 +92,7 @@ class PSBTTester:
                 "confirmations": 20
             }
         ]
+    
     
     def test_basic_psbt_creation(self) -> bool:
         """Test 1: Creació bàsica de PSBT"""
@@ -497,6 +499,13 @@ async def main():
     print("║              🧪 TEST SUITE - PSBT BIP-174 CREATOR 🧪            ║")
     print("╚══════════════════════════════════════════════════════════════════╝")
     print(f"{Colors.END}")
+
+    xpub = "vpub5Zs16Jexbgj86exZZdj2LT3ukA2gPXdGgdLZokbng1MgbP5jrm8eRkqAffKEJN2BnMzjkJ3G64Sk2XoB6FyAEnXAfmu7nthCGFXy1snAQHC"
+    for change in (False, True):
+        for i in (0, 1):  # prova 0/0 i 0/1 + 1/0 i 1/1
+            info = derive_address_and_path(xpub, "testnet", i, change=change)
+            print(("change" if change else "recv"), i, info["address"], info["path"])
+
     
     # Executar tests principals
     tester = PSBTTester()
