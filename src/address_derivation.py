@@ -3,11 +3,26 @@
 
 from typing import Dict
 import struct, hashlib, sys, traceback
-from hdwallet import HDWallet
-from hdwallet.cryptocurrencies import Bitcoin
-from hdwallet.hds.bip32 import BIP32HD
-from hdwallet.derivations.custom import CustomDerivation
 
+
+
+def _hdwallet_bits():
+    """
+    Importa 'hdwallet' només quan el necessitem, per evitar ImportError
+    durant la càrrega del mòdul (p.ex. en pytest collection).
+    """
+    try:
+        from hdwallet import HDWallet
+        from hdwallet.cryptocurrencies import Bitcoin
+        from hdwallet.hds.bip32 import BIP32HD
+        from hdwallet.derivations.custom import CustomDerivation
+    except Exception as e:
+        raise RuntimeError(
+            "El paquet 'hdwallet' no és accessible des d'aquest entorn. "
+            "Assegura't de tenir l'entorn virtual activat i haver instal·lat 'hdwallet' "
+            "(p. ex. amb: python -m pip install hdwallet)."
+        ) from e
+    return HDWallet, Bitcoin, BIP32HD, CustomDerivation
 
 # ---------- prefix → tipus adreça ----------
 def _purpose_and_method(xpub_like: str):
@@ -168,6 +183,9 @@ def _p2wpkh_address(pubkey_bytes: bytes, network: str) -> str:
 
 # ---------- derivació principal amb DEBUG ----------
 def derive_bitcoin_address(xpub_or_zpub: str, index: int = 0, change: bool = False, network: str = "mainnet") -> Dict:
+    
+    HDWallet, Bitcoin, BIP32HD, CustomDerivation = _hdwallet_bits()
+
     try:
         if index < 0 or index >= 2**31:
             raise ValueError("Index fora de rang no-hardened")

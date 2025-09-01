@@ -47,13 +47,7 @@ except ImportError:
     print("[WARNING] No s'ha trobat address_derivation.py")
 
 # IMPORTAR EL NOU CREADOR DE PSBT
-try:
-    from psbt_creator import PSBTCreator, create_transaction_psbt
-    PSBT_CREATOR_AVAILABLE = True
-    print("[INFO] Creador de PSBT BIP-174 disponible")
-except ImportError:
-    PSBT_CREATOR_AVAILABLE = False
-    print("[WARNING] No s'ha trobat psbt_creator.py - les transaccions usaran format JSON simplificat")
+from psbt_creator import PSBTCreator, create_transaction_psbt
 
 # Per la interfície
 from rich.console import Console
@@ -384,106 +378,34 @@ def create_transaction(
             }
         
         # Si tenim el creador de PSBT, usar-lo
-        if PSBT_CREATOR_AVAILABLE:
-            # Generar adreça de canvi real
-            change_info = derive_address_and_path(xpub, network, index=0, change=True)
-            change_address = change_info["address"]
-            
-            # Estimar fee (simplificat: fee_rate * bytes estimats)
-            amount_satoshis = int(amount_btc * 100_000_000)
-            estimated_size = 10 + 148 * len(utxos) + 34 * 2  # Aproximació
-            fee_satoshis = fee_rate * estimated_size
-            
-            # Crear PSBT real
-            result = create_transaction_psbt(
-                xpub=xpub,
-                recipient_address=recipient_address,
-                amount_btc=amount_btc,
-                utxos=utxos,
-                fee_satoshis=fee_satoshis,
-                change_address=change_address,
-                network=network
+        # Generar adreça de canvi real
+        change_info = derive_address_and_path(xpub, network, index=0, change=True)
+        change_address = change_info["address"]
+        
+        # Crear PSBT real (estimació de comissió a psbt_creator amb els UTXOs seleccionats)
+        result = create_transaction_psbt(
+            xpub=xpub,
+            recipient_address=recipient_address,
+            amount_btc=amount_btc,
+            utxos=utxos,
+            change_address=change_address,
+            network=network,
+            fee_rate=fee_rate
+        )
+        
+        if result["success"]:
+            # Afegir informació adicional per l'agent
+            result["psbt_format"] = "BIP-174 Standard"
+            result["ready_to_sign"] = True
+            result["instructions"] = (
+                "Aquest és un PSBT estàndard BIP-174. Per signar-lo:\n"
+                "1. Guarda el PSBT en un fitxer .psbt\n"
+                "2. Importa'l al teu wallet (Electrum, Bitcoin Core, etc.)\n"
+                "3. Signa i broadcasteja la transacció"
             )
-            
-            if result["success"]:
-                # Afegir informació adicional per l'agent
-                result["psbt_format"] = "BIP-174 Standard"
-                result["ready_to_sign"] = True
-                result["instructions"] = (
-                    "Aquest és un PSBT estàndard BIP-174. Per signar-lo:\n"
-                    "1. Guarda el PSBT en un fitxer .psbt\n"
-                    "2. Importa'l al teu wallet (Electrum, Bitcoin Core, etc.)\n"
-                    "3. Signa la transacció\n"
-                    "4. Difon la transacció signada a la xarxa"
-                )
-            
             return result
-            
         else:
-            # Fallback: crear JSON simplificat (com abans)
-            amount_satoshis = int(amount_btc * 100_000_000)
-            selected_utxos = []
-            total_input = 0
-            
-            sorted_utxos = sorted(utxos, key=lambda x: x["value_satoshis"], reverse=True)
-            
-            for utxo in sorted_utxos:
-                selected_utxos.append(utxo)
-                total_input += utxo["value_satoshis"]
-                
-                estimated_fee = fee_rate * (10 + 148 * len(selected_utxos) + 34 * 2)
-                
-                if total_input >= amount_satoshis + estimated_fee:
-                    break
-            
-            if total_input < amount_satoshis + estimated_fee:
-                return {
-                    "success": False,
-                    "error": f"Fons insuficients. Necessari: {(amount_satoshis + estimated_fee)/100_000_000:.8f} BTC, Disponible: {total_input/100_000_000:.8f} BTC"
-                }
-            
-            change = total_input - amount_satoshis - estimated_fee
-            
-            # Crear JSON simplificat
-            psbt = {
-                "warning": "Aquest és un format JSON simplificat, no un PSBT BIP-174 real",
-                "inputs": selected_utxos,
-                "outputs": [
-                    {
-                        "address": recipient_address,
-                        "value": amount_satoshis
-                    }
-                ],
-                "fee": estimated_fee,
-                "network": network
-            }
-            
-            if change > 546:  # Dust limit
-                change_info = derive_address_and_path(xpub, network, index=0, change=True)
-                psbt["outputs"].append({
-                    "address": change_info["address"],
-                    "value": change,
-                    "type": "change",
-                    "path": change_info["path"]
-                })
-            
-            return {
-                "success": True,
-                "psbt": json.dumps(psbt, indent=2),
-                "psbt_format": "JSON Simplified (not BIP-174)",
-                "total_input_btc": total_input / 100_000_000,
-                "amount_btc": amount_btc,
-                "fee_btc": estimated_fee / 100_000_000,
-                "change_btc": change / 100_000_000 if change > 546 else 0,
-                "num_inputs": len(selected_utxos),
-                "num_outputs": len(psbt["outputs"]),
-                "network": network,
-                "ready_to_sign": False,
-                "instructions": (
-                    "⚠️ Aquest NO és un PSBT estàndard. És un format JSON simplificat.\n"
-                    "Per crear un PSBT real, instal·la psbt_creator.py"
-                )
-            }
+            return result
         
     except Exception as e:
         return {
@@ -491,16 +413,12 @@ def create_transaction(
             "error": str(e)
         }
 
+
 @tool
 def decode_psbt(psbt_string: str) -> Dict:
     """
     Decodifica i valida un PSBT.
     """
-    if not PSBT_CREATOR_AVAILABLE:
-        return {
-            "success": False,
-            "error": "El decodificador de PSBT no està disponible. Instal·la psbt_creator.py"
-        }
     
     try:
         creator = PSBTCreator()
@@ -598,22 +516,22 @@ class BitcoinAIAgent:
         
         # System prompt actualitzat
         if not state["messages"] or not isinstance(state["messages"][0], SystemMessage):
-            psbt_info = "amb suport per PSBTs BIP-174 estàndard" if PSBT_CREATOR_AVAILABLE else "amb format JSON simplificat"
+            psbt_info = "amb suport per PSBTs BIP-174 estàndard"
             
             system_prompt = f"""Ets un agent expert en Bitcoin que ajuda els usuaris a gestionar les seves wallets {psbt_info}.
             
             Informació de context:
             - XPUB: {self.xpub}
             - Network: {self.network}
-            - PSBT Support: {'BIP-174 Standard' if PSBT_CREATOR_AVAILABLE else 'JSON Simplified'}
+            - PSBT Support: {'BIP-174 Standard'}
             
             Tens accés a aquestes eines:
             - get_balance: Per consultar el balanç
             - generate_address: Per generar noves adreces
             - list_utxos: Per veure les UTXOs disponibles
             - get_fee_rates: Per consultar les fees actuals
-            - create_transaction: Per crear transaccions {'(PSBT BIP-174)' if PSBT_CREATOR_AVAILABLE else '(JSON)'}
-            - decode_psbt: Per decodificar i validar PSBTs {'(disponible)' if PSBT_CREATOR_AVAILABLE else '(no disponible)'}
+            - create_transaction: Per crear transaccions {'(PSBT BIP-174)'}
+            - decode_psbt: Per decodificar i validar PSBTs {'(disponible)'}
             
             IMPORTANT:
             - Sempre proporciona TOTS els paràmetres necessaris per les eines
@@ -664,7 +582,7 @@ class BitcoinAIAgent:
         """Processa un missatge de l'usuari"""
         
         print(f"[DEBUG] Missatge rebut: {message}")
-        print(f"[DEBUG] PSBT Support: {'BIP-174' if PSBT_CREATOR_AVAILABLE else 'JSON'}")
+        print(f"[DEBUG] PSBT Support: {'BIP-174'}")
         
         # Crear estat inicial
         initial_messages = [HumanMessage(content=message)]
@@ -681,7 +599,7 @@ class BitcoinAIAgent:
             "context": {
                 "xpub": self.xpub,
                 "network": self.network,
-                "psbt_support": PSBT_CREATOR_AVAILABLE
+                "psbt_support": True
             }
         }
         
@@ -715,11 +633,10 @@ class BitcoinAIAgent:
                         response = msg.content
                         
                         # Afegir informació sobre el format PSBT si es va crear una transacció
-                        if psbt_created and PSBT_CREATOR_AVAILABLE:
+                        if psbt_created:
                             response += "\n\n📄 **PSBT creat en format BIP-174 estàndard**"
                             response += "\nPots signar aquest PSBT amb qualsevol wallet compatible (Electrum, Bitcoin Core, hardware wallets, etc.)"
-                        elif psbt_created and not PSBT_CREATOR_AVAILABLE:
-                            response += "\n\n⚠️ **Nota:** S'ha creat un format JSON simplificat, no un PSBT estàndard."
+                       
                         
                         return response
                     elif not hasattr(msg, "tool_calls"):
@@ -741,7 +658,7 @@ class BitcoinAIAgent:
         """Configura l'agent amb una XPUB"""
         self.xpub = xpub
         self.network = network
-        psbt_status = "BIP-174 Standard" if PSBT_CREATOR_AVAILABLE else "JSON Simplified"
+        psbt_status = "BIP-174 Standard"
         self.console.print(f"[green]✅ Agent configurat amb XPUB per {network}[/green]")
         self.console.print(f"[cyan]📄 PSBT Format: {psbt_status}[/cyan]")
 
@@ -758,7 +675,7 @@ class BitcoinAssistant:
         """Executa l'assistent"""
         
         # Benvinguda actualitzada
-        psbt_info = "amb PSBTs BIP-174 estàndard" if PSBT_CREATOR_AVAILABLE else "amb format JSON simplificat"
+        psbt_info = "amb PSBTs BIP-174 estàndard"
         
         self.console.print(Panel(
             f"[bold blue]🤖 Agent IA Bitcoin[/bold blue]\n"
@@ -770,7 +687,7 @@ class BitcoinAssistant:
             "• 'Crea una transacció per enviar 0.001 BTC a [adreça]'\n"
             "• 'Decodifica aquest PSBT: [base64]'\n"
             "• 'Quines són les fees actuals?'",
-            title=f"Benvingut - {'PSBT BIP-174' if PSBT_CREATOR_AVAILABLE else 'Mode Simplificat'}",
+            title=f"Benvingut - {'PSBT BIP-174'}",
             border_style="blue"
         ))
         
@@ -805,10 +722,8 @@ class BitcoinAssistant:
         network_env = os.getenv("BITCOIN_NETWORK", "testnet").lower()
         
         # Mostrar estat PSBT
-        if PSBT_CREATOR_AVAILABLE:
-            self.console.print("[green]✅ Suport PSBT BIP-174 activat[/green]")
-        else:
-            self.console.print("[yellow]⚠️  Mode simplificat (instal·la psbt_creator.py per PSBTs reals)[/yellow]")
+        self.console.print("[green]✅ Suport PSBT BIP-174 activat[/green]")
+
         
         # Configuració API key
         if not api_key or api_key == "your-key-here":
@@ -844,7 +759,7 @@ class BitcoinAssistant:
             self.console.print("\n[green]✅ Agent IA configurat correctament![/green]")
             self.console.print(f"[green]   Network: {network}[/green]")
             self.console.print(f"[green]   XPUB: {xpub[:20]}...{xpub[-10:]}[/green]")
-            self.console.print(f"[green]   PSBT: {'BIP-174 Standard' if PSBT_CREATOR_AVAILABLE else 'JSON Simplified'}[/green]")
+            self.console.print(f"[green]   PSBT: {'BIP-174 Standard'}[/green]")
         except Exception as e:
             self.console.print(f"[red]Error: {e}[/red]")
             raise
