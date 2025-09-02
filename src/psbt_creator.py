@@ -594,11 +594,6 @@ def create_transaction_psbt(
 
     # Selecció d’UTXOs i càlcul de fee
     if fee_satoshis is None:
-        if not change_address:
-            # Placeholder si no te la passen; el recomanable és derivar-la de l’XPUB (m/1/i)
-            change_address = (
-                "tb1qchange" + "0" * 30 if network == "testnet" else "bc1qchange" + "0" * 30
-            )
         sel = _select_utxos_vbytes(
             utxos=utxos,
             amount_sats=amount_satoshis,
@@ -633,9 +628,10 @@ def create_transaction_psbt(
     outputs = [{"address": recipient_address, "value": amount_satoshis}]
     if change_satoshis > DUST_THRESHOLD:
         if not change_address:
-            change_address = (
-                "tb1qchange" + "0" * 30 if network == "testnet" else "bc1qchange" + "0" * 30
-            )
+            return {
+                "success": False,
+                "error": "Change output required (> dust) but no change_address provided. Derive a change address from the XPUB and retry.",
+            }
         outputs.append({"address": change_address, "value": int(change_satoshis)})
 
     # Crear PSBT

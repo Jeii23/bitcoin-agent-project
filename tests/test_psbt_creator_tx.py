@@ -107,3 +107,22 @@ def test_output_script_generation_for_various_address_types(addr):
     )
     assert res["success"], res.get("error")
     assert res["num_outputs"] in (1,2)
+
+@pytest.mark.usefixtures("block_requests")
+def test_fail_fast_when_change_needed_but_missing():
+    import psbt_creator
+    # UTXO large enough to produce non-dust change if change address absent
+    utxos = [
+        {"txid": "44"*32, "vout": 0, "value_satoshis": 150_000, "address": "tb1q0wwa08elht6gq8uzjsl66mdhjl7rcsetakcf4t"}
+    ]
+    res = psbt_creator.create_transaction_psbt(
+        xpub='xpub_unused_for_tests',
+        recipient_address="tb1qfqzk956wtxlvvghewk5hqu6vwqjtjm5qmua7wx",
+        amount_btc=0.0005,  # 50_000 sats
+        utxos=utxos,
+        fee_satoshis=1000,
+        network="testnet",
+        change_address=None  # intentionally missing
+    )
+    assert not res["success"], "Should fail without explicit change_address when change required"
+    assert "change" in res.get("error", "").lower()
