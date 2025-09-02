@@ -22,14 +22,15 @@ def test_create_simple_psbt_with_change():
             "address": "tb1q0wwa08elht6gq8uzjsl66mdhjl7rcsetakcf4t",  # valid testnet bech32
         }
     ]
+    # Use a known valid recipient address (vector index 1)
     res = psbt_creator.create_transaction_psbt(
         xpub='xpub_unused_for_tests',
-        recipient_address="tb1qs8kgyvu7j5m8w0mxkawdt8a9c97m3x8c9sawct",
+        recipient_address="tb1qfqzk956wtxlvvghewk5hqu6vwqjtjm5qmua7wx",
         amount_btc=0.00050000,  # 50_000 sats
         utxos=utxos,
         fee_satoshis=1000,
         network="testnet",
-        change_address="tb1qnjqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq3x0k8"  # dummy but bech32-like
+        change_address="tb1q07cj0eftvl2v2505hnfuzjxlyn00cthh7pfc3y"  # valid change address (vector index 2)
     )
 
     assert res["success"], res.get("error")
@@ -54,12 +55,12 @@ def test_dust_change_collapses_into_fee():
     ]
     res = psbt_creator.create_transaction_psbt(
         xpub='xpub_unused_for_tests',
-        recipient_address="tb1qg2t9c2mamc2r9l68v9r80xkqz0r5yyptqetk6k",
+        recipient_address="tb1qfqzk956wtxlvvghewk5hqu6vwqjtjm5qmua7wx",
         amount_btc=0.00050000,   # 50_000 sats
         utxos=utxos,
         fee_satoshis=900,
         network="testnet",
-        change_address="tb1qtestchangeaddressxxxxxxxxxxxxxxxxxxxxxx0yk"
+        change_address="tb1q07cj0eftvl2v2505hnfuzjxlyn00cthh7pfc3y"
     )
     assert res["success"], res.get("error")
     # change would be 100 sats -> dust → expect 1 output only
@@ -75,12 +76,12 @@ def test_insufficient_funds_error():
     ]
     res = psbt_creator.create_transaction_psbt(
         xpub='xpub_unused_for_tests',
-        recipient_address="tb1qg2t9c2mamc2r9l68v9r80xkqz0r5yyptqetk6k",
+        recipient_address="tb1qfqzk956wtxlvvghewk5hqu6vwqjtjm5qmua7wx",
         amount_btc=0.00030000,   # 30_000 sats
         utxos=utxos,
         fee_satoshis=1000,
         network="testnet",
-        change_address="tb1qtestchangeaddressxxxxxxxxxxxxxxxxxxxxxx0yk"
+        change_address="tb1q07cj0eftvl2v2505hnfuzjxlyn00cthh7pfc3y"
     )
     assert not res["success"]
     err = res.get("error","").lower()
@@ -102,7 +103,7 @@ def test_output_script_generation_for_various_address_types(addr):
         utxos=[{"txid": "33"*32, "vout": 0, "value_satoshis": 50_000, "address": "tb1q0wwa08elht6gq8uzjsl66mdhjl7rcsetakcf4t"}],
         fee_satoshis=500,
         network="testnet",
-        change_address="tb1qtestchangeaddressxxxxxxxxxxxxxxxxxxxxxx0yk"
+        change_address="tb1q07cj0eftvl2v2505hnfuzjxlyn00cthh7pfc3y"
     )
     assert res["success"], res.get("error")
     assert res["num_outputs"] in (1,2)

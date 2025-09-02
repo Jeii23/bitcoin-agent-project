@@ -98,14 +98,14 @@ class PSBTTester:
         """Test 1: Creació bàsica de PSBT"""
         try:
             # Usar adreça vàlida per testnet
-            psbt = self.creator.create_psbt(
+            psbt_res = self.creator.create_psbt(
                 inputs=[self.test_utxos[0]],
                 outputs=[
                     {"address": "tb1q0wwa08elht6gq8uzjsl66mdhjl7rcsetakcf4t", "value": 90000}
                 ]
             )
-            
-            # Verificar que és Base64 vàlid
+            assert psbt_res["success"]
+            psbt = psbt_res["psbt"]
             decoded = base64.b64decode(psbt)
             
             # Verificar magic bytes
@@ -124,7 +124,7 @@ class PSBTTester:
         """Test 2: PSBT amb múltiples inputs i outputs"""
         try:
             # Usar adreces vàlides
-            psbt = self.creator.create_psbt(
+            psbt_res = self.creator.create_psbt(
                 inputs=self.test_utxos[:2],  # 2 inputs
                 outputs=[
                     {"address": "tb1q0wwa08elht6gq8uzjsl66mdhjl7rcsetakcf4t", "value": 60000},
@@ -132,7 +132,8 @@ class PSBTTester:
                     {"address": "tb1qfqzk956wtxlvvghewk5hqu6vwqjtjm5qmua7wx", "value": 9000}
                 ]
             )
-            
+            assert psbt_res["success"]
+            psbt = psbt_res["psbt"]
             decoded = base64.b64decode(psbt)
             if decoded[:5] != b'psbt\xff':
                 print_test("PSBT multi-input/output", False, "Format invàlid")
@@ -270,12 +271,12 @@ class PSBTTester:
         """Test 7: Decodificar i validar PSBT"""
         try:
             # Primer crear un PSBT amb adreça vàlida
-            psbt = self.creator.create_psbt(
+            psbt_res = self.creator.create_psbt(
                 inputs=[self.test_utxos[0]],
                 outputs=[{"address": "tb1q0wwa08elht6gq8uzjsl66mdhjl7rcsetakcf4t", "value": 90000}]
             )
-            
-            # Després decodificar-lo
+            assert psbt_res["success"]
+            psbt = psbt_res["psbt"]
             decoded = self.creator.decode_psbt(psbt)
             
             if not decoded["valid"]:
@@ -454,41 +455,38 @@ class PSBTTester:
         
         return results
 
-async def test_integration_with_agent():
+def test_integration_with_agent():
     """Test d'integració amb l'agent Bitcoin"""
     print_section("🔌 TEST D'INTEGRACIÓ AMB L'AGENT")
     
+    import os, asyncio
     try:
         from bitcoin_ai_agent import BitcoinAIAgent
-        import os
-        
-        api_key = os.getenv("OPENAI_API_KEY")
-        if not api_key or api_key == "your-key-here":
-            print(f"{Colors.YELLOW}⚠️  No s'ha trobat API key, saltant test d'integració{Colors.END}")
-            return
-        
+    except ImportError:
+        print(f"{Colors.YELLOW}⚠️  No es pot importar bitcoin_ai_agent.py{Colors.END}")
+        return
+
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key or api_key == "your-key-here":
+        print(f"{Colors.YELLOW}⚠️  No s'ha trobat API key, saltant test d'integració{Colors.END}")
+        return
+
+    async def _run():
         print(f"{Colors.CYAN}Creant agent amb PSBT millorat...{Colors.END}")
-        
-        # Crear agent
         agent = BitcoinAIAgent(api_key)
         xpub = "vpub5Zs16Jexbgj86exZZdj2LT3ukA2gPXdGgdLZokbng1MgbP5jrm8eRkqAffKEJN2BnMzjkJ3G64Sk2XoB6FyAEnXAfmu7nthCGFXy1snAQHC"
         agent.setup(xpub, "testnet")
-        
-        # Test query
         print(f"\n{Colors.CYAN}Provant crear una transacció amb l'agent...{Colors.END}")
         response = await agent.chat("Vull crear una transacció per enviar 0.001 BTC a tb1qfqzk956wtxlvvghewk5hqu6vwqjtjm5qmua7wx")
-        
         print(f"\n{Colors.GREEN}Resposta de l'agent:{Colors.END}")
         print(response)
-        
-        # Verificar si la resposta conté informació PSBT
         if "psbt" in response.lower() or "transacció" in response.lower():
             print_test("Integració amb agent", True, "L'agent pot crear transaccions")
         else:
             print_test("Integració amb agent", False, "Resposta no conté informació PSBT")
-            
-    except ImportError:
-        print(f"{Colors.YELLOW}⚠️  No es pot importar bitcoin_ai_agent.py{Colors.END}")
+
+    try:
+        asyncio.run(_run())
     except Exception as e:
         print(f"{Colors.RED}❌ Error en integració: {str(e)}{Colors.END}")
 

@@ -130,6 +130,7 @@ def derive_address_and_path(xpub: str, network: str, index: int, change: bool = 
     """
     Deriva adreça + path. Prioritza la derivació personalitzada.
     """
+    last_error: Optional[str] = None
     # 1) Derivació personalitzada de l'usuari
     if CUSTOM_DERIVATION_AVAILABLE:
         try:
@@ -138,8 +139,10 @@ def derive_address_and_path(xpub: str, network: str, index: int, change: bool = 
                 return {"address": res["address"], "path": res.get("path", "")}
             else:
                 print(f"[WARN] Derivació personalitzada ha fallat: {res.get('error')}")
+                last_error = res.get("error") or last_error
         except Exception as e:
             print(f"[ERROR] Derivació personalitzada: {e}")
+            last_error = str(e)
 
     # 2) Fallback: HDWallet simple
     # 2) Fallback: HDWallet simple
@@ -163,16 +166,9 @@ def derive_address_and_path(xpub: str, network: str, index: int, change: bool = 
             return {"address": address, "path": path}
         except Exception as e:
             print(f"[ERROR] Fallback HDWallet: {e}")
-
-    # 3) Últim recurs: fake
-    prefix = "tb1q" if network == "testnet" else "bc1q"
-    kind = "change" if change else "receive"
-    addr_hash = hashlib.sha256(f"{xpub}{kind}{index}".encode()).hexdigest()
-    fake_address = f"{prefix}{addr_hash[:39]}"
-    coin_type = "1'" if network == "testnet" else "0'"
-    chain = 1 if change else 0
-    path = f"m/84'/{coin_type}/0'/{chain}/{index}"
-    return {"address": fake_address, "path": path}
+            last_error = str(e)
+    # 3) Ja no generem adreces sintètiques: llança error clar
+    raise ValueError(f"Address derivation failed (no synthetic fallback). Last error: {last_error or 'unknown'}")
 
 def derive_real_address(xpub: str, network: str, index: int, change: bool = False) -> str:
     """Manté la signatura antiga per compatibilitat"""
@@ -292,13 +288,29 @@ def list_utxos(xpub: str, network: str = "testnet") -> Dict:
     Llista totes les UTXOs (Unspent Transaction Outputs) disponibles.
     """
     try:
-        addresses = [derive_real_address(xpub, network, i, change=False) for i in range(5)]
-        all_utxos = []
+        # Escaneja tant adreces de recepció (chain 0) com de canvi (chain 1)
+        # Mantenim un límit modest per no fer massa crides (es pot ajustar fàcilment)
+        scan_receive = 10
+        scan_change = 5  # normalment menys exposades externament
+
+        address_entries: List[Dict] = []
+        for change_flag, limit in ((False, scan_receive), (True, scan_change)):
+            for i in range(limit):
+                info = derive_address_and_path(xpub, network, i, change=change_flag)
+                address_entries.append({
+                    "address": info["address"],
+                    "path": info["path"],
+                    "index": i,
+                    "change": change_flag,
+                })
+
+        all_utxos: List[Dict] = []
         api_base = "https://blockstream.info/testnet/api" if network == "testnet" else "https://blockstream.info/api"
 
-        for address in addresses:
+        for entry in address_entries:
+            addr = entry["address"]
             try:
-                response = requests.get(f"{api_base}/address/{address}/utxo", timeout=5)
+                response = requests.get(f"{api_base}/address/{addr}/utxo", timeout=5)
                 if response.status_code == 200:
                     utxos = response.json()
                     for utxo in utxos:
@@ -307,18 +319,26 @@ def list_utxos(xpub: str, network: str = "testnet") -> Dict:
                             "vout": utxo.get("vout", 0),
                             "value_satoshis": utxo.get("value", 0),
                             "value_btc": utxo.get("value", 0) / 100_000_000,
-                            "address": address,
+                            "address": addr,
+                            "path": entry["path"],
+                            "index": entry["index"],
+                            "change": entry["change"],
                             "confirmations": utxo.get("status", {}).get("confirmations", 0)
                         })
-            except:
+            except Exception:
+                # Ignorem errors puntuals d'una adreça per no interrompre tot el procés
                 continue
 
+        total_value_sat = sum(u["value_satoshis"] for u in all_utxos)
         return {
             "success": True,
             "utxos": all_utxos,
             "total_utxos": len(all_utxos),
-            "total_value_satoshis": sum(u["value_satoshis"] for u in all_utxos),
-            "total_value_btc": sum(u["value_satoshis"] for u in all_utxos) / 100_000_000
+            "total_value_satoshis": total_value_sat,
+            "total_value_btc": total_value_sat / 100_000_000,
+            "receive_addresses_checked": scan_receive,
+            "change_addresses_checked": scan_change,
+            "network": network,
         }
     except Exception as e:
         return {"success": False, "error": str(e)}
@@ -634,8 +654,10 @@ class BitcoinAIAgent:
                         
                         # Afegir informació sobre el format PSBT si es va crear una transacció
                         if psbt_created:
+                            # Afegim sempre la PSBT completa (sense truncar) per facilitar còpia
                             response += "\n\n📄 **PSBT creat en format BIP-174 estàndard**"
                             response += "\nPots signar aquest PSBT amb qualsevol wallet compatible (Electrum, Bitcoin Core, hardware wallets, etc.)"
+                            response += "\n\nPSBT (Base64 completa):\n" + psbt_created + "\n"
                        
                         
                         return response

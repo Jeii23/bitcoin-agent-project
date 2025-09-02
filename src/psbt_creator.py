@@ -219,28 +219,66 @@ class PSBTCreator:
         return self._decode_base58(address)
 
     def _decode_bech32(self, address: str) -> Tuple[int, bytes]:
-        """Decodifica adreça Bech32 (simplificada)"""
+        """Decodifica adreça Bech32/Bech32m amb validació de checksum (BIP-173/BIP-350)."""
+        BECH32_CONST = 1
+        BECH32M_CONST = 0x2bc830a3
         charset = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
 
+        # Lower-case enforcement (mixed-case invalid)
+        if address != address.lower() and address != address.upper():
+            raise ValueError("Bech32 mixed-case no permès")
+        address = address.lower()
+
         pos = address.rfind("1")
-        if pos < 1 or pos + 7 > len(address):
+        if pos < 1 or pos + 7 > len(address):  # hrp + separator + 6 checksum min
             raise ValueError("Format Bech32 invàlid")
 
         hrp = address[:pos]
         data_part = address[pos + 1 :]
+        if any(ord(c) < 33 or ord(c) > 126 for c in address):
+            raise ValueError("Caràcter fora de rang ASCII a Bech32")
 
-        data = []
+        data: List[int] = []
         for c in data_part:
             if c not in charset:
                 raise ValueError(f"Caràcter invàlid en Bech32: {c}")
             data.append(charset.index(c))
 
-        # Eliminar checksum (últims 6 caràcters)
-        data = data[:-6]
+        if len(data) < 7:
+            raise ValueError("Massa curt per contenir dades + checksum")
 
-        witness_version = data[0]
-        witness_program = self._convertbits(data[1:], 5, 8, False)
-        return witness_version, bytes(witness_program)
+        # Split payload + checksum
+        payload = data[:-6]
+        checksum = data[-6:]
+
+        def _hrp_expand(h: str) -> List[int]:
+            return [ord(x) >> 5 for x in h] + [0] + [ord(x) & 31 for x in h]
+
+        def _polymod(vals: List[int]) -> int:
+            GEN = [0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3]
+            chk = 1
+            for v in vals:
+                b = chk >> 25
+                chk = (chk & 0x1ffffff) << 5 ^ v
+                for i in range(5):
+                    if (b >> i) & 1:
+                        chk ^= GEN[i]
+            return chk
+
+        polymod = _polymod(_hrp_expand(hrp) + payload + checksum)
+
+        witness_version = payload[0]
+        program = self._convertbits(payload[1:], 5, 8, False)
+
+        const_expected = BECH32_CONST if witness_version == 0 else BECH32M_CONST
+        if polymod != const_expected:
+            raise ValueError("Checksum Bech32/Bech32m invàlid")
+
+        wp = bytes(program)
+        if not (2 <= len(wp) <= 40):
+            raise ValueError("Longitud de witness program fora de rang")
+        # Per a P2WPKH i P2WSH longituds esperades 20 o 32; no forcem per flexibilitat
+        return witness_version, wp
 
     def _convertbits(self, data: List[int], frombits: int, tobits: int, pad: bool) -> List[int]:
         """Converteix entre amplades de bits (per a Bech32)"""
@@ -310,26 +348,28 @@ class PSBTCreator:
 
         try:
             version, addr_hash = self._decode_address(address)
-
-            # P2WPKH (witness v0, 20 bytes program)
-            if address.startswith(("bc1", "tb1")) and len(addr_hash) == 20:
-                script = b"\x00\x14" + addr_hash
-            # P2PKH
-            elif version in [0x00, 0x6F]:  # mainnet/testnet P2PKH
+            if address.startswith(("bc1", "tb1")):
+                # SegWit (version és witness version 0..16)
+                wver = version
+                # P2WPKH (v0, 20 bytes)
+                if wver == 0 and len(addr_hash) == 20:
+                    script = b"\x00\x14" + addr_hash
+                # P2WSH (v0, 32 bytes)
+                elif wver == 0 and len(addr_hash) == 32:
+                    script = b"\x00\x20" + addr_hash
+                # P2TR (Taproot v1, 32 bytes) OP_1 (0x51) + push32
+                elif wver == 1 and len(addr_hash) == 32:
+                    script = b"\x51\x20" + addr_hash
+                else:
+                    raise ValueError("Unsupported or invalid segwit witness program length/version")
+            elif version in [0x00, 0x6F]:  # P2PKH
                 script = b"\x76\xa9\x14" + addr_hash + b"\x88\xac"
-            # P2SH
-            elif version in [0x05, 0xC4]:  # mainnet/testnet P2SH
+            elif version in [0x05, 0xC4]:  # P2SH
                 script = b"\xa9\x14" + addr_hash + b"\x87"
             else:
-                # Fallback: assumir P2WPKH
-                script = b"\x00\x14" + addr_hash[:20]
-        except Exception:
-            # OP_RETURN de 0 bytes només si amount=0; si no, fem servir hash fictici P2WPKH
-            if amount_satoshis == 0:
-                script = b"\x6a\x00"
-            else:
-                fake_hash = hashlib.sha256(address.encode()).digest()[:20]
-                script = b"\x00\x14" + fake_hash
+                raise ValueError("Unsupported address type")
+        except Exception as e:
+            raise ValueError(f"Invalid recipient/change address: {address} ({e})")
 
         output += self._compact_size(len(script)) + script
         return output
@@ -352,9 +392,14 @@ class PSBTCreator:
         locktime: int = 0,
         version: int = 2,
         xpub: Optional[str] = None,
-    ) -> str:
+        return_dict: bool = True,
+    ) -> Dict:
         """
         Construeix una PSBT v0 amb la transacció unsigned i mapes d'inputs/outputs mínims.
+
+        Nou comportament: retorna un diccionari estructurat amb camps clau.
+        Compatibilitat: si es vol el string Base64 directament, accedir a ['psbt']
+        o utilitzar el helper `create_psbt_base64` (veure més avall).
         """
         # 1) Transacció unsigned (sense witnesses)
         tx_bytes = b""
@@ -402,11 +447,27 @@ class PSBTCreator:
                 # Witness UTXO mínim: amount (8 bytes) + scriptPubKey
                 witness_utxo = struct.pack("<Q", int(inp.get("value_satoshis", 0)))
                 try:
-                    _, addr_hash = self._decode_address(inp.get("address", ""))
-                    script = b"\x00\x14" + addr_hash[:20]  # assumim P2WPKH
+                    version_or_prefix, addr_hash = self._decode_address(inp.get("address", ""))
+                    address_str = inp.get("address", "")
+                    if address_str.startswith(("bc1", "tb1")):
+                        wver = version_or_prefix
+                        if wver == 0 and len(addr_hash) == 20:  # P2WPKH
+                            script = b"\x00\x14" + addr_hash
+                        elif wver == 0 and len(addr_hash) == 32:  # P2WSH
+                            script = b"\x00\x20" + addr_hash
+                        elif wver == 1 and len(addr_hash) == 32:  # P2TR
+                            script = b"\x51\x20" + addr_hash
+                        else:
+                            raise ValueError("Unsupported segwit witness program for input")
+                    elif version_or_prefix in (0x00, 0x6F) and len(addr_hash) >= 20:
+                        script = b"\x76\xa9\x14" + addr_hash[:20] + b"\x88\xac"  # P2PKH
+                    elif version_or_prefix in (0x05, 0xC4) and len(addr_hash) >= 20:
+                        script = b"\xa9\x14" + addr_hash[:20] + b"\x87"  # P2SH
+                    else:
+                        raise ValueError("Unsupported legacy address type for input")
                     witness_utxo += self._compact_size(len(script)) + script
-                except Exception:
-                    witness_utxo += b"\x00"  # script buit com a fallback
+                except Exception as e:
+                    raise ValueError(f"Failed to build witness_utxo script for input address {inp.get('address')}: {e}")
 
                 input_map += self._write_key_value(PSBT_IN_WITNESS_UTXO, b"", witness_utxo)
 
@@ -421,7 +482,29 @@ class PSBTCreator:
             output_map += b"\x00"
             psbt_bytes += output_map
 
-        return base64.b64encode(psbt_bytes).decode("ascii")
+        psbt_base64 = base64.b64encode(psbt_bytes).decode("ascii")
+        result: Dict = {
+            "success": True,
+            "psbt": psbt_base64,
+            "num_inputs": len(inputs),
+            "num_outputs": len(outputs),
+            "unsigned_tx_hex": tx_bytes.hex(),
+            "inputs": inputs,
+            "outputs": outputs,
+            "version": version,
+        }
+        return result
+
+    # Backwards compatibility helper (antic comportament string)
+    def create_psbt_base64(
+        self,
+        inputs: List[Dict],
+        outputs: List[Dict],
+        locktime: int = 0,
+        version: int = 2,
+        xpub: Optional[str] = None,
+    ) -> str:
+        return self.create_psbt(inputs, outputs, locktime, version, xpub)["psbt"]
 
     def decode_psbt(self, psbt_base64: str) -> Dict:
         """Decodificador simple per inspeccionar camps bàsics."""
@@ -557,8 +640,9 @@ def create_transaction_psbt(
 
     # Crear PSBT
     try:
-        psbt_base64 = creator.create_psbt(inputs=selected_utxos, outputs=outputs, xpub=xpub)
+        psbt_build = creator.create_psbt(inputs=selected_utxos, outputs=outputs, xpub=xpub)
 
+        psbt_base64 = psbt_build["psbt"]
         return {
             "success": True,
             "psbt": psbt_base64,
@@ -567,11 +651,12 @@ def create_transaction_psbt(
             "amount_btc": amount_btc,
             "fee_btc": int(fee_satoshis) / 1e8,
             "change_btc": (change_satoshis / 1e8) if change_satoshis > DUST_THRESHOLD else 0,
-            "num_inputs": len(selected_utxos),
-            "num_outputs": len(outputs),
+            "num_inputs": psbt_build.get("num_inputs", len(selected_utxos)),
+            "num_outputs": psbt_build.get("num_outputs", len(outputs)),
             "selected_utxos": selected_utxos,
             "outputs": outputs,
             "network": network,
+            "unsigned_tx_hex": psbt_build.get("unsigned_tx_hex"),
         }
     except Exception as e:
         return {"success": False, "error": f"Error creant PSBT: {str(e)}"}

@@ -20,8 +20,9 @@ VECTORS = [
 
 @pytest.mark.integration
 def test_vectors_match_known_results_with_cli_xpub(xpub_cli, network_cli):
+    # Fallback XPUB (testnet) si no es proporciona via CLI per evitar skip
     if not xpub_cli:
-        pytest.skip("--xpub no proporcionat (usa: pytest -m integration --xpub '...')")
+        xpub_cli = "vpub5Zs16Jexbgj86exZZdj2LT3ukA2gPXdGgdLZokbng1MgbP5jrm8eRkqAffKEJN2BnMzjkJ3G64Sk2XoB6FyAEnXAfmu7nthCGFXy1snAQHC"
 
     # Import tardà per evitar errors d'importació si falta alguna dep
     try:

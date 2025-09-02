@@ -293,9 +293,10 @@ def derive_real_address_hdwallet(xpub: str, network: str, index: int, change: bo
     res = derive_bitcoin_address(xpub, index, change, network)
     if res["success"]:
         return res["address"]
-    prefix = "tb1q" if (network == "testnet" or _version_implies_testnet(xpub)) else "bc1q"
-    addr_hash = hashlib.sha256(f"{xpub}{'change' if change else 'receive'}{index}".encode()).hexdigest()
-    return f"{prefix}{addr_hash[:39]}"
+    # Eliminat el fallback de generació d'adreça sintètica perquè pot confondre l'usuari.
+    # En lloc d'això aixequem un error clar indicant la causa real.
+    error_msg = res.get("error") or "Unknown derivation failure"
+    raise ValueError(f"Derivation failed (no fake address created): {error_msg}")
 
 if __name__ == "__main__":
     test_hdwallet()

@@ -7,12 +7,12 @@ def test_decode_psbt_roundtrip():
     # Build a small psbt
     build = psbt_creator.create_transaction_psbt(
         xpub='xpub_unused_for_tests',
-        recipient_address="tb1qg2t9c2mamc2r9l68v9r80xkqz0r5yyptqetk6k",
+        recipient_address="tb1qfqzk956wtxlvvghewk5hqu6vwqjtjm5qmua7wx",
         amount_btc=0.0002,
         utxos=[{"txid":"44"*32, "vout":0, "value_satoshis":80_000, "address":"tb1q0wwa08elht6gq8uzjsl66mdhjl7rcsetakcf4t"}],
         fee_satoshis=800,
         network="testnet",
-        change_address="tb1qtestchangeaddressxxxxxxxxxxxxxxxxxxxxxx0yk"
+        change_address="tb1q07cj0eftvl2v2505hnfuzjxlyn00cthh7pfc3y"
     )
     assert build.get("success", True), build.get("error")
 

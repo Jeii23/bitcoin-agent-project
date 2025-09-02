@@ -7,6 +7,7 @@ import asyncio
 import os
 import sys
 from pathlib import Path
+import pytest
 
 # Afegir el directori src al path
 sys.path.append(str(Path(__file__).parent))
@@ -15,7 +16,7 @@ sys.path.append(str(Path(__file__).parent))
 from dotenv import load_dotenv
 load_dotenv()
 
-async def test_agent():
+def test_agent():
     """Test bàsic de l'agent"""
     
     # Importar després de configurar el path
@@ -58,13 +59,16 @@ async def test_agent():
     print("\n🧪 Executant tests...")
     print("-" * 50)
     
-    for query in test_queries:
-        print(f"\n💬 Pregunta: {query}")
-        try:
-            response = await agent.chat(query)
-            print(f"🤖 Resposta: {response}")
-        except Exception as e:
-            print(f"❌ Error: {e}")
+    async def _run():
+        for query in test_queries:
+            print(f"\n💬 Pregunta: {query}")
+            try:
+                response = await agent.chat(query)
+                print(f"🤖 Resposta: {response}")
+            except Exception as e:
+                print(f"❌ Error: {e}")
+
+    asyncio.run(_run())
     
     print("\n" + "=" * 50)
     print("✅ TEST COMPLETAT")
