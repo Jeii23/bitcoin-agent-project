@@ -10,10 +10,18 @@ import sys
 from pathlib import Path
 from decimal import Decimal
 from typing import Dict, List
-from bitcoin_ai_agent import derive_address_and_path 
 
-# Afegir el directori actual al path
-sys.path.append(str(Path(__file__).parent))
+# Assegura que el directori 'src' és al PYTHONPATH abans d'importar mòduls locals
+SRC_ROOT = Path(__file__).parent.parent / "src"
+if str(SRC_ROOT) not in sys.path:
+    sys.path.append(str(SRC_ROOT))
+
+from bitcoin_ai_agent import derive_address_and_path  # type: ignore
+
+# Afegir també el directori actual (per compatibilitat amb altres imports relatius antics)
+CURRENT_DIR = Path(__file__).parent
+if str(CURRENT_DIR) not in sys.path:
+    sys.path.append(str(CURRENT_DIR))
 
 # Carregar .env
 from dotenv import load_dotenv

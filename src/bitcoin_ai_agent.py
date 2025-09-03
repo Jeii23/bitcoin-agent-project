@@ -394,6 +394,27 @@ def create_transaction(
     Crea una transacció Bitcoin (PSBT estàndard BIP-174).
     """
     try:
+        # Safety clamp for pathological fee rates (LLM might pick fastestFee overly high on testnet)
+        original_fee_rate = fee_rate
+        fee_notes: List[str] = []
+        # Hard upper cap
+        if fee_rate > 150:
+            fee_notes.append(f"Fee rate {fee_rate} sat/vB clamped to 150 sat/vB to avoid excessive fees.")
+            fee_rate = 150
+        # Additional proportional cap for very small sends (avoid >15% fee)
+        amount_sats = int(round(amount_btc * 100_000_000))
+        # Rough minimal vbytes (1in/2out segwit) ~140 => projected fee = fee_rate*140
+        projected_fee = fee_rate * 140
+        if projected_fee > amount_sats * 0.15:
+            # Lower fee_rate so projected fee ~10% of amount (still generous); floor 2 sat/vB
+            target_fee = max(int(amount_sats * 0.10), 200)  # at least 200 sats so not absurdly low
+            new_rate = max(2, min(fee_rate, target_fee // 140))
+            if new_rate < fee_rate:
+                fee_notes.append(
+                    f"Fee rate reduced from {fee_rate} to {new_rate} sat/vB to keep fee <=10% of amount (projected)."
+                )
+                fee_rate = new_rate
+
         # Obtenir UTXOs
         utxos_result = list_utxos.invoke({"xpub": xpub, "network": network})
         if not utxos_result["success"]:
@@ -410,7 +431,7 @@ def create_transaction(
         # Generar adreça de canvi real
         change_info = derive_address_and_path(xpub, network, index=0, change=True)
         change_address = change_info["address"]
-        
+
         # Crear PSBT real (estimació de comissió a psbt_creator amb els UTXOs seleccionats)
         result = create_transaction_psbt(
             xpub=xpub,
@@ -419,7 +440,7 @@ def create_transaction(
             utxos=utxos,
             change_address=change_address,
             network=network,
-            fee_rate=fee_rate
+            fee_rate=fee_rate,
         )
         
         if result["success"]:
@@ -432,6 +453,14 @@ def create_transaction(
                 "2. Importa'l al teu wallet (Electrum, Bitcoin Core, etc.)\n"
                 "3. Signa i broadcasteja la transacció"
             )
+            # Annotate fee moderation if applied
+            if fee_notes:
+                result["fee_policy_notes"] = fee_notes
+            if original_fee_rate != fee_rate:
+                result["original_fee_rate"] = original_fee_rate
+                result["effective_fee_rate"] = fee_rate
+            else:
+                result["effective_fee_rate"] = fee_rate
             return result
         else:
             return result
@@ -475,6 +504,57 @@ def decode_psbt(psbt_string: str) -> Dict:
             "error": str(e)
         }
 
+@tool
+def create_transaction_manual(
+    xpub: str,
+    recipient_address: str,
+    amount_btc: float,
+    utxo_ids: List[str],
+    fee_rate: int = 10,
+    network: str = "testnet",
+    change_index: int = 0,
+) -> Dict:
+    """Crea una PSBT triant manualment UTXOs (format utxo_ids: "<txid>:<vout>").
+
+    1. Llista UTXOs via list_utxos.
+    2. Filtra les que coincideixen amb utxo_ids.
+    3. Passa-les a create_transaction_psbt com manual_selected_utxos.
+    """
+    try:
+        utxos_result = list_utxos.invoke({"xpub": xpub, "network": network})
+        if not utxos_result.get("success"):
+            return utxos_result
+        all_utxos = utxos_result.get("utxos", [])
+        wanted = set(utxo_ids)
+        selected = [u for u in all_utxos if f"{u.get('txid')}:{u.get('vout')}" in wanted]
+        missing = wanted - {f"{u.get('txid')}:{u.get('vout')}" for u in selected}
+        if not selected:
+            return {"success": False, "error": "Cap UTXO trobada entre les especificades", "missing": list(missing)}
+
+        # Derivar adreça de canvi (canvi index configurable)
+        change_info = derive_address_and_path(xpub, network, index=change_index, change=True)
+        change_address = change_info["address"]
+
+        build = create_transaction_psbt(
+            xpub=xpub,
+            recipient_address=recipient_address,
+            amount_btc=amount_btc,
+            utxos=all_utxos,
+            change_address=change_address,
+            network=network,
+            fee_rate=fee_rate,
+            manual_selected_utxos=selected,
+        )
+        if build.get("success"):
+            build["selection_mode"] = "manual"
+            build["requested_utxos"] = utxo_ids
+            build["used_utxos"] = [f"{u.get('txid')}:{u.get('vout')}" for u in selected]
+            if missing:
+                build["missing"] = list(missing)
+        return build
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
 # ============== AGENT IA PRINCIPAL ==============
 
 class BitcoinAIAgent:
@@ -495,6 +575,10 @@ class BitcoinAIAgent:
             list_utxos,
             get_fee_rates,
             create_transaction,
+            create_transaction_manual,
+            # Nova eina per selecció manual d'UTXOs
+            # (permet especificar exactament quines UTXOs entraràn a la PSBT)
+            
             decode_psbt  # Nova eina
         ]
         
@@ -560,6 +644,7 @@ class BitcoinAIAgent:
             - list_utxos: Per veure les UTXOs disponibles
             - get_fee_rates: Per consultar les fees actuals
             - create_transaction: Per crear transaccions {'(PSBT BIP-174)'}
+            - create_transaction_manual: Per crear una transacció indicant EXACTAMENT quines UTXOs (format txid:vout) i una fee rate
             - decode_psbt: Per decodificar i validar PSBTs {'(disponible)'}
             
             IMPORTANT:

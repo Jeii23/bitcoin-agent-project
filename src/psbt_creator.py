@@ -13,6 +13,12 @@ from decimal import Decimal
 import requests
 import math
 
+# Derivation helper
+try:
+    from address_derivation import derive_bitcoin_address as _derive_addr_internal
+except Exception:  # pragma: no cover
+    _derive_addr_internal = None
+
 # Shared codec utilities (Base58Check + hash160 + varints)
 import codec
 
@@ -353,6 +359,8 @@ class PSBTCreator:
         version: int = 2,
         xpub: Optional[str] = None,
         return_dict: bool = True,
+        include_derivations: bool = True,
+        proprietary: Optional[List[Tuple[bytes, int, bytes, bytes]]] = None,
     ) -> Dict:
         """
         Construeix una PSBT v0 amb la transacció unsigned i mapes d'inputs/outputs mínims.
@@ -388,15 +396,156 @@ class PSBTCreator:
         # 2) PSBT = magic + global map + input maps + output maps
         psbt_bytes = PSBT_MAGIC
 
+        # Helper: extract serialized xpub & fingerprint if provided
+        def _parse_xpub(xpub_s: str):
+            """Return (raw_serialized, key_data, fingerprint, depth, child_num_val, version_int).
+
+            If parsing fails returns all None.
+            """
+            try:
+                raw = codec.b58decode_check(xpub_s)
+                if len(raw) != 78:
+                    return (None,)*6
+                version_int = int.from_bytes(raw[0:4], "big")
+                depth = raw[4]
+                parent_fpr = raw[5:9]
+                child_num_val = int.from_bytes(raw[9:13], "big")  # big-endian uint32
+                chain_code = raw[13:45]
+                key_data = raw[45:78]  # 33 bytes (0x02/0x03 compressed or 0x00 + priv)
+                fp = codec.hash160(key_data)[:4]
+                return raw, key_data, fp, depth, child_num_val, version_int
+            except Exception:
+                return (None,)*6
+
+        def _guess_xpub_path(depth: int, child_num_val: int, version_int: int, network: str) -> Optional[List[int]]:
+            """Heuristically reconstruct a standard account-level derivation path for common SLIP-0132 versions.
+
+            Returns list of uint32 indices (with hardened bit where appropriate) whose length SHOULD equal depth.
+            If we cannot confidently guess, returns None so we skip GLOBAL_XPUB to avoid wallet parser errors.
+            """
+            # Harden helper
+            H = 0x80000000
+            # Map version bytes to purpose'
+            purpose_map = {
+                # Mainnet
+                0x0488B21E: 44,  # xpub (assume BIP44)
+                0x049d7cb2: 49,  # ypub (BIP49 p2wpkh-p2sh)
+                0x04b24746: 84,  # zpub (BIP84 p2wpkh)
+                0x0295b43f: 48,  # Ypub (multisig p2wsh-p2sh) -> treat as 48'
+                0x02aa7ed3: 48,  # Zpub (multisig p2wsh) -> 48'
+                # Testnet
+                0x043587CF: 44,  # tpub (assume BIP44)
+                0x044a5262: 49,  # upub (BIP49 testnet)
+                0x045f1cf6: 84,  # vpub (BIP84 testnet)
+                0x024289ef: 48,  # Upub (multisig p2wsh-p2sh)
+                0x02575483: 48,  # Vpub (multisig p2wsh)
+            }
+            coin_type = 1 if network == "testnet" else 0
+            purpose = purpose_map.get(version_int)
+
+            # Simple cases
+            if depth == 0:
+                return []
+            if depth == 1:
+                # Only child index known
+                return [child_num_val]
+            if depth == 2:
+                if purpose is not None:
+                    return [(purpose | 0x80000000), (coin_type | 0x80000000)]
+                return None
+            if depth == 3:
+                if purpose is not None:
+                    return [
+                        (purpose | 0x80000000),
+                        (coin_type | 0x80000000),
+                        child_num_val,  # already includes hardened bit if set
+                    ]
+                return None
+            # Deeper (account-level or change/address) xpubs not expected here; skip.
+            return None
+
+        serialized_xpub: Optional[bytes] = None
+        root_pubkey: Optional[bytes] = None
+        root_fp: Optional[bytes] = None
+        xpub_depth: Optional[int] = None
+        xpub_childnum: Optional[int] = None
+        xpub_version_int: Optional[int] = None
+        if xpub:
+            (
+                serialized_xpub,
+                root_pubkey,
+                root_fp,
+                xpub_depth,
+                xpub_childnum,
+                xpub_version_int,
+            ) = _parse_xpub(xpub)
+
+        # Attempt derivation mapping address->(pubkey, path indices)
+        addr_deriv_map: Dict[str, Tuple[bytes, List[int]]] = {}
+        if include_derivations and xpub and _derive_addr_internal and root_fp and root_pubkey:
+            # Collect all addresses we need to map (inputs + outputs)
+            needed = {i.get("address", "") for i in inputs} | {o.get("address", "") for o in outputs}
+            # Determine probable derivation purpose from first address (assume BIP84 for bc1/tb1 q)
+            # We'll just scan both chains up to a reasonable bound (e.g., 150) or until resolved
+            remaining = set(a for a in needed if a)
+            MAX_SCAN = 150
+            for change_flag in (False, True):
+                for idx in range(MAX_SCAN):
+                    if not remaining:
+                        break
+                    try:
+                        res = _derive_addr_internal(xpub, index=idx, change=change_flag, network=self.network)
+                        if res.get("success"):
+                            addr = res.get("address")
+                            if addr in remaining:
+                                pub_hex = res.get("public_key") or ""
+                                if pub_hex.startswith("0x"):
+                                    pub_hex = pub_hex[2:]
+                                pub_bytes = bytes.fromhex(pub_hex)
+                                # Parse path into indices (skip leading 'm')
+                                path = res.get("path", "")
+                                indices: List[int] = []
+                                if path.startswith("m/"):
+                                    for comp in path[2:].split("/"):
+                                        hardened = comp.endswith("'")
+                                        num_str = comp.rstrip("'")
+                                        try:
+                                            val = int(num_str)
+                                            if hardened:
+                                                val |= 0x80000000
+                                            indices.append(val)
+                                        except Exception:
+                                            indices = []
+                                            break
+                                addr_deriv_map[addr] = (pub_bytes, indices)
+                                remaining.remove(addr)
+                    except Exception:
+                        continue
+
         # Global Map
         global_map = b""
         global_map += self._write_key_value(PSBT_GLOBAL_UNSIGNED_TX, b"", tx_bytes)
         global_map += self._write_key_value(PSBT_GLOBAL_VERSION, b"", struct.pack("<I", 0))  # PSBT v0
+        if serialized_xpub and root_fp and xpub_depth is not None and xpub_childnum is not None and xpub_version_int is not None:
+            path_indices = _guess_xpub_path(xpub_depth, xpub_childnum, xpub_version_int, self.network)
+            if path_indices is not None and len(path_indices) == xpub_depth:
+                value = root_fp + b"".join(struct.pack("<I", i) for i in path_indices)
+                global_map += self._write_key_value(PSBT_GLOBAL_XPUB, serialized_xpub, value)
+            # else: skip adding GLOBAL_XPUB to avoid depth/path mismatch
+        # Proprietary global entries (0xFC) using provided tuples
+        if proprietary:
+            for prefix, subtype, keydata, value in proprietary:
+                # key format: 0xFC | prefix | subtype | keydata  (prefix length embedded in CompactSize when writing key already handled by _write_key_value)
+                pkey = b"\xFC" + prefix + bytes([subtype]) + keydata
+                # BIP174 expects we write length(key) + key then length(value) + value; reuse _write_key_value logic by faking type
+                # We can't directly call _write_key_value (it prepends type) so replicate minimal logic here:
+                k = pkey
+                global_map += codec.compact_size_encode(len(k)) + k + codec.compact_size_encode(len(value)) + value
         global_map += b"\x00"  # separator
         psbt_bytes += global_map
 
         # Input Maps
-        for inp in inputs:
+        for idx_inp, inp in enumerate(inputs):
             input_map = b""
 
             prev_tx = self._fetch_transaction(inp["txid"])
@@ -426,18 +575,29 @@ class PSBTCreator:
                         raise ValueError("Unsupported legacy address type for input")
                     witness_utxo += self._compact_size(len(script)) + script
                 except Exception as e:
-                    raise ValueError(f"Failed to build witness_utxo script for input address {inp.get('address')}: {e}")
+                    raise ValueError(
+                        f"Failed to build witness_utxo script for input address {inp.get('address')}: {e}"
+                    )
 
                 input_map += self._write_key_value(PSBT_IN_WITNESS_UTXO, b"", witness_utxo)
 
-            # SIGHASH_ALL per defecte
+            # SIGHASH_ALL per defecte (no configuració avançada encara)
             input_map += self._write_key_value(PSBT_IN_SIGHASH_TYPE, b"", struct.pack("<I", 1))
+            # BIP32 derivation (if known)
+            if include_derivations and xpub and root_fp and inp.get("address") in addr_deriv_map:
+                pub, indices = addr_deriv_map[inp.get("address")]  # type: ignore
+                val = root_fp + b"".join(struct.pack("<I", i) for i in indices)
+                input_map += self._write_key_value(PSBT_IN_BIP32_DERIVATION, pub, val)
             input_map += b"\x00"
             psbt_bytes += input_map
 
-        # Output Maps (buits per ara; aquí es podrien afegir BIP32 derivations, etc.)
-        for _out in outputs:
+        # Output Maps (with optional derivations)
+        for out in outputs:
             output_map = b""
+            if include_derivations and xpub and root_fp and out.get("address") in addr_deriv_map:
+                pub, indices = addr_deriv_map[out.get("address")]  # type: ignore
+                val = root_fp + b"".join(struct.pack("<I", i) for i in indices)
+                output_map += self._write_key_value(PSBT_OUT_BIP32_DERIVATION, pub, val)
             output_map += b"\x00"
             psbt_bytes += output_map
 
@@ -529,6 +689,7 @@ def create_transaction_psbt(
     network: str = "testnet",
     fee_rate: int = 10,
     fee_satoshis: Optional[int] = None,
+    manual_selected_utxos: Optional[List[Dict]] = None,
 ) -> Dict:
     """
     Crea un PSBT per una transacció:
@@ -540,37 +701,67 @@ def create_transaction_psbt(
     # amount a sats
     amount_satoshis = int(round(amount_btc * 100_000_000))
 
-    # Selecció d’UTXOs i càlcul de fee
-    if fee_satoshis is None:
-        sel = _select_utxos_vbytes(
-            utxos=utxos,
-            amount_sats=amount_satoshis,
-            fee_rate_sat_vb=int(fee_rate),
-            recipient_addr=recipient_address,
-            change_addr=change_address,
-        )
-        if not sel["success"]:
-            return {"success": False, "error": sel["error"]}
-
-        selected_utxos = sel["selected_utxos"]
-        fee_satoshis = sel["fee_satoshis"]
-        change_satoshis = sel["change_satoshis"]
+    # Manual UTXO selection path (explicit list bypasses greedy selection)
+    if manual_selected_utxos:
+        selected_utxos = manual_selected_utxos
         total_input = sum(int(u.get("value_satoshis", 0)) for u in selected_utxos)
+        if fee_satoshis is None:
+            # Estimate fee with chosen inputs (attempt both no-change and change scenarios)
+            addrs = [u.get("address", "") for u in selected_utxos]
+            vb_no = _estimate_vbytes(addrs, recipient_address, include_change=False, change_addr=None)
+            est_fee_no = math.ceil(int(fee_rate) * vb_no)
+            change_no = total_input - amount_satoshis - est_fee_no
+            if change_no < DUST_THRESHOLD and total_input >= amount_satoshis + est_fee_no:
+                fee_satoshis = est_fee_no
+                change_satoshis = 0
+            else:
+                # Need change output
+                vb_ch = _estimate_vbytes(addrs, recipient_address, include_change=True, change_addr=change_address)
+                est_fee_ch = math.ceil(int(fee_rate) * vb_ch)
+                change_ch = total_input - amount_satoshis - est_fee_ch
+                if change_ch >= DUST_THRESHOLD and total_input >= amount_satoshis + est_fee_ch:
+                    if not change_address:
+                        return {"success": False, "error": "Change output necessari però no s'ha proporcionat change_address (manual_selected_utxos)."}
+                    fee_satoshis = est_fee_ch
+                    change_satoshis = change_ch
+                else:
+                    return {"success": False, "error": "Fons insuficients amb les UTXOs manuals seleccionades o canvi < dust."}
+        else:
+            # Fee fixed; validate funds
+            if total_input < amount_satoshis + int(fee_satoshis):
+                return {"success": False, "error": "Fons insuficients amb les UTXOs manuals seleccionades."}
+            change_satoshis = total_input - amount_satoshis - int(fee_satoshis)
     else:
-        # Compatibilitat: selecció simple segons fee fixa
-        selected_utxos: List[Dict] = []
-        total_input = 0
-        for utxo in sorted(utxos, key=lambda x: x.get("value_satoshis", 0), reverse=True):
-            selected_utxos.append(utxo)
-            total_input += int(utxo.get("value_satoshis", 0))
-            if total_input >= amount_satoshis + int(fee_satoshis):
-                break
-        if total_input < amount_satoshis + int(fee_satoshis):
-            return {
-                "success": False,
-                "error": f"Fons insuficients. Necessari: {((amount_satoshis + int(fee_satoshis))/1e8):.8f} BTC, Disponible: {(total_input/1e8):.8f} BTC",
-            }
-        change_satoshis = total_input - amount_satoshis - int(fee_satoshis)
+        # Selecció d’UTXOs i càlcul de fee (automàtic o compatibilitat)
+        if fee_satoshis is None:
+            sel = _select_utxos_vbytes(
+                utxos=utxos,
+                amount_sats=amount_satoshis,
+                fee_rate_sat_vb=int(fee_rate),
+                recipient_addr=recipient_address,
+                change_addr=change_address,
+            )
+            if not sel["success"]:
+                return {"success": False, "error": sel["error"]}
+            selected_utxos = sel["selected_utxos"]
+            fee_satoshis = sel["fee_satoshis"]
+            change_satoshis = sel["change_satoshis"]
+            total_input = sum(int(u.get("value_satoshis", 0)) for u in selected_utxos)
+        else:
+            # Compatibilitat: selecció simple segons fee fixa
+            selected_utxos = []
+            total_input = 0
+            for utxo in sorted(utxos, key=lambda x: x.get("value_satoshis", 0), reverse=True):
+                selected_utxos.append(utxo)
+                total_input += int(utxo.get("value_satoshis", 0))
+                if total_input >= amount_satoshis + int(fee_satoshis):
+                    break
+            if total_input < amount_satoshis + int(fee_satoshis):
+                return {
+                    "success": False,
+                    "error": f"Fons insuficients. Necessari: {((amount_satoshis + int(fee_satoshis))/1e8):.8f} BTC, Disponible: {(total_input/1e8):.8f} BTC",
+                }
+            change_satoshis = total_input - amount_satoshis - int(fee_satoshis)
 
     # Outputs
     outputs = [{"address": recipient_address, "value": amount_satoshis}]
