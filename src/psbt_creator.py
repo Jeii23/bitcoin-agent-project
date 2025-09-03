@@ -13,6 +13,9 @@ from decimal import Decimal
 import requests
 import math
 
+# Shared codec utilities (Base58Check + hash160 + varints)
+import codec
+
 # ==========================
 # Constants per a PSBT
 # ==========================
@@ -49,6 +52,8 @@ PSBT_OUT_REDEEM_SCRIPT = b"\x00"
 PSBT_OUT_WITNESS_SCRIPT = b"\x01"
 PSBT_OUT_BIP32_DERIVATION = b"\x02"
 
+from addressing import detect_address_type  # shared classification
+
 # ==========================
 # Heurístiques vbytes i llindars
 # ==========================
@@ -71,19 +76,8 @@ OUTPUT_VBYTES = {
 }
 
 
-def _detect_address_type(addr: str) -> str:
-    """Heurística simple per classificar un tipus d’adreça."""
-    a = (addr or "").lower()
-    if a.startswith(("bc1p", "tb1p")):
-        return "p2tr"  # taproot (bech32m)
-    if a.startswith(("bc1q", "tb1q")):
-        return "p2wpkh"  # segwit v0 pk hash
-    if a.startswith(("1", "m", "n")):
-        return "p2pkh"
-    if a.startswith(("3", "2")):
-        # Pot ser p2sh o p2sh-p2wpkh; imputem cost d'input p2sh-p2wpkh (més comú en transició)
-        return "p2sh-p2wpkh"
-    return "p2wpkh"
+def _detect_address_type(addr: str) -> str:  # shim for backward internal reference
+    return detect_address_type(addr)
 
 
 def _input_vbytes_for_address(addr: str) -> int:
@@ -183,15 +177,7 @@ class PSBTCreator:
 
     # ---------- Utils binaris / hashing ----------
     def _compact_size(self, n: int) -> bytes:
-        """Codifica un enter en format CompactSize (Bitcoin)"""
-        if n < 0xFD:
-            return struct.pack("<B", n)
-        elif n <= 0xFFFF:
-            return b"\xfd" + struct.pack("<H", n)
-        elif n <= 0xFFFFFFFF:
-            return b"\xfe" + struct.pack("<I", n)
-        else:
-            return b"\xff" + struct.pack("<Q", n)
+        return codec.compact_size_encode(n)
 
     def _hash256(self, data: bytes) -> bytes:
         """Double SHA256"""
@@ -306,40 +292,14 @@ class PSBTCreator:
         return ret
 
     def _decode_base58(self, address: str) -> Tuple[int, bytes]:
-        """Decodifica adreça Base58Check (P2PKH/P2SH)"""
-        alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+        """Decodifica adreça Base58Check (P2PKH/P2SH) utilitzant codec.b58decode_check."""
         try:
-            n = 0
-            for c in address:
-                if c not in alphabet:
-                    raise ValueError(f"Caràcter invàlid en Base58: {c}")
-                n = n * 58 + alphabet.index(c)
-
-            full_bytes = n.to_bytes((n.bit_length() + 7) // 8, "big")
-
-            pad = 0
-            for c in address:
-                if c == "1":
-                    pad += 1
-                else:
-                    break
-            full_bytes = b"\x00" * pad + full_bytes
-
-            if len(full_bytes) < 5:
-                raise ValueError("Adreça massa curta")
-
-            payload = full_bytes[:-4]
-            checksum = full_bytes[-4:]
-
-            if self._hash256(payload)[:4] != checksum:
-                raise ValueError("Checksum invàlid")
-
+            payload = codec.b58decode_check(address)
             if len(payload) < 2:
                 raise ValueError("Payload massa curt")
-
             return payload[0], payload[1:]
-        except Exception as e:
-            raise ValueError(f"Error decodificant Base58: {str(e)}")
+        except Exception as e:  # Normalitza el missatge consistent amb versió anterior
+            raise ValueError(f"Error decodificant Base58: {e}")
 
     # ---------- Construcció de transacció ----------
     def _create_transaction_output(self, address: str, amount_satoshis: int) -> bytes:
@@ -405,7 +365,6 @@ class PSBTCreator:
         tx_bytes = b""
         tx_bytes += struct.pack("<I", version)
 
-        # (Nota: per simplicitat, no posem marker/flag aquí)
 
         tx_bytes += self._compact_size(len(inputs))
 
@@ -552,21 +511,10 @@ class PSBTCreator:
             return {"valid": False, "error": str(e)}
 
     def _read_compact_size(self, data: bytes) -> Tuple[int, int]:
-        """Llegeix un CompactSize i retorna (valor, bytes consumits)"""
-        if not data:
+        try:
+            return codec.compact_size_decode(data)
+        except Exception:
             return 0, 0
-
-        first = data[0]
-        if first < 0xFD:
-            return first, 1
-        elif first == 0xFD and len(data) >= 3:
-            return struct.unpack("<H", data[1:3])[0], 3
-        elif first == 0xFE and len(data) >= 5:
-            return struct.unpack("<I", data[1:5])[0], 5
-        elif first == 0xFF and len(data) >= 9:
-            return struct.unpack("<Q", data[1:9])[0], 9
-        else:
-            return 0, 1
 
 
 # ==========================

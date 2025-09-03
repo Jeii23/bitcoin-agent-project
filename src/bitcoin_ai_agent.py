@@ -81,31 +81,32 @@ if DEFAULT_NETWORK not in ["mainnet", "testnet"]:
 
 
 def _address_has_history(address: str, network: str) -> bool:
-    """
-    Retorna True si l'adreça ha tingut algun UTXO (encara que ja estigui gastat).
-    Usa l'endpoint /address per mirar funded_txo_count (chain+mempool).
+    """Best-effort check of whether an address has ever received funds.
+
+    Previous behaviour on network error returned True (conservative) which caused
+    skipping fresh indexes when the API had transient issues. We now:
+      1. Try /address for funded_txo_count.
+      2. Fallback to /address/<addr>/utxo (detects only current UTXOs).
+      3. On total failure, return False so address can still be offered; this
+         restores prior UX where first unused appeared earlier instead of jumping ahead.
     """
     api_base = "https://blockstream.info/testnet/api" if network == "testnet" else "https://blockstream.info/api"
     try:
-        r = requests.get(f"{api_base}/address/{address}", timeout=8)
-        if r.status_code != 200:
-            # Fallback suau: si l'endpoint principal falla, prova /utxo (NO detecta ús històric gastat)
-            r2 = requests.get(f"{api_base}/address/{address}/utxo", timeout=5)
-            if r2.status_code == 200:
-                utxos = r2.json()
-                return len(utxos) > 0
-            return False
-
-        info = r.json() or {}
-        chain = info.get("chain_stats", {}) or {}
-        memp = info.get("mempool_stats", {}) or {}
-        funded = chain.get("funded_txo_count", 0) + memp.get("funded_txo_count", 0)
-        # Alternativament es pot mirar tx_count, però funded_txo_count és més específic
-        return funded > 0
+        r = requests.get(f"{api_base}/address/{address}", timeout=6)
+        if r.status_code == 200:
+            info = r.json() or {}
+            chain = info.get("chain_stats", {}) or {}
+            memp = info.get("mempool_stats", {}) or {}
+            funded = chain.get("funded_txo_count", 0) + memp.get("funded_txo_count", 0)
+            return funded > 0
+        # fallback lightweight
+        r2 = requests.get(f"{api_base}/address/{address}/utxo", timeout=4)
+        if r2.status_code == 200:
+            return len(r2.json()) > 0
+        return False
     except Exception:
-        # En cas d'error de xarxa, millor ser conservador i considerar-la com a "usada"
-        # per evitar reusar sense voler una adreça que ja va rebre fons.
-        return True
+        # Network uncertainty: treat as unused (False) to avoid skipping deterministic indices.
+        return False
 
 
 
@@ -307,6 +308,7 @@ def list_utxos(xpub: str, network: str = "testnet") -> Dict:
         all_utxos: List[Dict] = []
         api_base = "https://blockstream.info/testnet/api" if network == "testnet" else "https://blockstream.info/api"
 
+        network_errors = 0
         for entry in address_entries:
             addr = entry["address"]
             try:
@@ -325,12 +327,14 @@ def list_utxos(xpub: str, network: str = "testnet") -> Dict:
                             "change": entry["change"],
                             "confirmations": utxo.get("status", {}).get("confirmations", 0)
                         })
+                else:
+                    network_errors += 1
             except Exception:
-                # Ignorem errors puntuals d'una adreça per no interrompre tot el procés
+                network_errors += 1
                 continue
 
         total_value_sat = sum(u["value_satoshis"] for u in all_utxos)
-        return {
+        result = {
             "success": True,
             "utxos": all_utxos,
             "total_utxos": len(all_utxos),
@@ -340,6 +344,11 @@ def list_utxos(xpub: str, network: str = "testnet") -> Dict:
             "change_addresses_checked": scan_change,
             "network": network,
         }
+        if len(all_utxos) == 0 and network_errors >= (scan_receive + scan_change):
+            # Probably offline / API blocked; surface diagnostic rather than silent empty set
+            result["note"] = "Cap UTXO retornada i totes les consultes han fallat (possible problema de xarxa o rate-limit)."
+            result["network_errors"] = network_errors
+        return result
     except Exception as e:
         return {"success": False, "error": str(e)}
 

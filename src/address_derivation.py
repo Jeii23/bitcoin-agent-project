@@ -4,6 +4,9 @@
 from typing import Dict
 import struct, hashlib, sys, traceback
 
+# Shared codec utilities (deduplicated Base58Check, hash160, etc.)
+import codec
+
 
 
 def _hdwallet_bits():
@@ -33,76 +36,8 @@ def _purpose_and_method(xpub_like: str):
         return "49'", "p2sh_p2wpkh_address"
     return "44'", "p2pkh_address"  # BIP44 per xpub/tpub
 
-# ---------- Base58Check ----------
-try:
-    import base58  # pip install base58
-    _HAS_BASE58 = True
-except Exception:
-    base58 = None
-    _HAS_BASE58 = False
-
-# Assegura't de tenir (o conservar) aquest alfabet:
-_B58_ALPHABET = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
-_B58_INDEX = {c: i for i, c in enumerate(_B58_ALPHABET)}
-
-
-def _b58decode_check(s: str) -> bytes:
-    """
-    Decodifica Base58Check i retorna el payload (sense el checksum de 4 bytes).
-    Si hi ha la llibreria `base58`, la fem servir; sinó, manual fallback.
-    """
-    # 1) Prova amb la llibreria si està disponible
-    if _HAS_BASE58:
-        try:
-            return base58.b58decode_check(s)
-        except Exception as e:
-            # Mantén el mateix missatge que espera el codi existent
-            raise ValueError("Base58 checksum invalid") from e
-
-    # 2) Fallback manual (sense dependències)
-    if not s:
-        raise ValueError("Empty Base58 string")
-
-    num = 0
-    pad = 0
-    # compta els '1' inicials (bytes 0x00)
-    for ch in s.encode():
-        if ch == ord("1") and num == 0:
-            pad += 1
-            continue
-        try:
-            num = num * 58 + _B58_INDEX[ch]
-        except KeyError:
-            raise ValueError(f"Invalid Base58 character: {chr(ch)!r}")
-
-    # passa a bytes i afegeix el padding dels '1' inicials
-    body = num.to_bytes((num.bit_length() + 7) // 8, "big") or b"\x00"
-    decoded = (b"\x00" * pad) + body
-
-    if len(decoded) < 5:
-        raise ValueError("Base58 too short")
-
-    payload, checksum = decoded[:-4], decoded[-4:]
-    expected = hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4]
-    if checksum != expected:
-        raise ValueError("Base58 checksum invalid")
-    return payload
-
-
-def _b58encode_check(payload: bytes) -> str:
-    chk = hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4]
-    full = payload + chk
-    n = int.from_bytes(full, "big")
-    s = bytearray()
-    while n > 0:
-        n, r = divmod(n, 58)
-        s.append(_B58_ALPHABET[r])
-    pad = 0
-    for b in full:
-        if b == 0: pad += 1
-        else: break
-    s.extend(b"1" * pad)
-    return bytes(reversed(s)).decode()
+_b58decode_check = codec.b58decode_check  # Shim for existing internal usage
+_b58encode_check = codec.b58encode_check
 
 # ---------- mapes de versions SLIP-0132 ----------
 _VERSION_MAP_TO_XPUB = {
@@ -137,36 +72,9 @@ def _version_implies_testnet(xpub_like: str) -> bool:
 
 # ---------- helpers d’adreça ----------
 def _hash160(b: bytes) -> bytes:
-    return hashlib.new("ripemd160", hashlib.sha256(b).digest()).digest()
+    return codec.hash160(b)
 
-_BECH32_CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
-def _bech32_hrp_expand(hrp): return [ord(x) >> 5 for x in hrp] + [0] + [ord(x) & 31 for x in hrp]
-def _bech32_polymod(values):
-    g = [0x3b6a57b2,0x26508e6d,0x1ea119fa,0x3d4233dd,0x2a1462b3]
-    chk = 1
-    for v in values:
-        b = chk >> 25
-        chk = ((chk & 0x1ffffff) << 5) ^ v
-        for i in range(5): chk ^= g[i] if ((b >> i) & 1) else 0
-    return chk
-def _bech32_create_checksum(hrp, data):
-    pm = _bech32_polymod(_bech32_hrp_expand(hrp) + data + [0]*6) ^ 1
-    return [(pm >> 5 * (5 - i)) & 31 for i in range(6)]
-def _bech32_encode(hrp, data):
-    return hrp + "1" + "".join(_BECH32_CHARSET[d] for d in data + _bech32_create_checksum(hrp, data))
-def _convertbits(data, frombits, tobits, pad=True):
-    acc=0; bits=0; ret=[]; maxv=(1<<tobits)-1; max_acc=(1<<(frombits+tobits-1))-1
-    for b in data:
-        if b < 0 or (b >> frombits): return None
-        acc = ((acc<<frombits)|b) & max_acc; bits += frombits
-        while bits >= tobits:
-            bits -= tobits; ret.append((acc>>bits)&maxv)
-    if pad and bits: ret.append((acc<<(tobits-bits))&maxv)
-    elif not pad and (bits>=frombits or ((acc<<(tobits-bits))&maxv)): return None
-    return ret
-def _encode_segwit_address(hrp, witver, witprog):
-    data = [witver] + _convertbits(list(witprog), 8, 5, True)
-    return _bech32_encode(hrp, data)
+_encode_segwit_address = codec.encode_segwit_address  # Reexport for existing usage
 
 def _p2pkh_address(pubkey_bytes: bytes, network: str) -> str:
     vh = (b"\x6f" if network == "testnet" else b"\x00") + _hash160(pubkey_bytes)
