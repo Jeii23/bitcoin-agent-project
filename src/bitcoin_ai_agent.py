@@ -14,6 +14,7 @@ from decimal import Decimal
 from datetime import datetime
 import requests
 from pathlib import Path
+from typing import Tuple
 
 # Carregar variables d'entorn des del fitxer .env
 from dotenv import load_dotenv
@@ -109,6 +110,79 @@ def _address_has_history(address: str, network: str) -> bool:
         return False
 
 
+# ================= SHARED UTXO SCAN HELPERS =================
+
+def _api_base(network: str) -> str:
+    return "https://blockstream.info/testnet/api" if network == "testnet" else "https://blockstream.info/api"
+
+
+def _fetch_address_utxos(address: str, network: str, timeout: float = 5.0, retries: int = 2) -> List[Dict]:
+    """Fetch UTXOs for a single address with small retry budget.
+
+    Returns empty list if all attempts fail (never raises) to keep deterministic higher-level code.
+    """
+    base = _api_base(network)
+    last_error: Optional[Exception] = None
+    for attempt in range(retries + 1):
+        try:
+            r = requests.get(f"{base}/address/{address}/utxo", timeout=timeout)
+            if r.status_code == 200:
+                data = r.json() or []
+                if isinstance(data, list):
+                    return data
+            # Non-200: keep trying
+        except Exception as e:  # network / JSON
+            last_error = e
+        # tiny backoff (no asyncio so simple sleep) only if more attempts left
+        if attempt < retries:
+            try:
+                import time
+                time.sleep(0.15 * (attempt + 1))
+            except Exception:
+                pass
+    # All failed
+    return []
+
+
+def _fetch_address_utxos_status(address: str, network: str, timeout: float = 5.0, retries: int = 2) -> Tuple[List[Dict], bool]:
+    """Variant returning (utxos, ok_flag) where ok_flag=True only if an HTTP 200 was received.
+
+    Needed so list_utxos can distinguish between 'truly empty' and network failure for diagnostics.
+    """
+    base = _api_base(network)
+    for attempt in range(retries + 1):
+        try:
+            r = requests.get(f"{base}/address/{address}/utxo", timeout=timeout)
+            if r.status_code == 200:
+                data = r.json() or []
+                return (data if isinstance(data, list) else [], True)
+        except Exception:
+            pass
+        if attempt < retries:
+            try:
+                import time
+                time.sleep(0.15 * (attempt + 1))
+            except Exception:
+                pass
+    return ([], False)
+
+
+def _enumerate_addresses(xpub: str, network: str, receive_limit: int, change_limit: int) -> List[Dict]:
+    """Derive a deterministic set of candidate addresses (receive + change)."""
+    addresses: List[Dict] = []
+    for change_flag, limit in ((False, receive_limit), (True, change_limit)):
+        for i in range(limit):
+            info = derive_address_and_path(xpub, network, i, change=change_flag)
+            addresses.append({
+                "address": info["address"],
+                "path": info.get("path", ""),
+                "index": i,
+                "change": change_flag,
+            })
+    return addresses
+
+
+
 
 
 # ============== ESTAT DE L'AGENT ==============
@@ -184,48 +258,39 @@ def get_balance(xpub: str, network: str = "testnet") -> Dict:
     Obté el balanç d'una wallet Bitcoin desde la XPUB.
     """
     try:
-        addresses = []
-        for chain_is_change in (False, True):  # False=receive (m/.../0/i), True=change (m/.../1/i)
-            for i in range(10):  # p.ex. 10 per cada chain
-                info = derive_address_and_path(xpub, network, i, change=chain_is_change)
-                addresses.append({
-                    "address": info["address"],
-                    "path": info["path"],
-                    "change": chain_is_change,
-                    "index": i,
+        # Reuse the exact same enumeration & fetching strategy as list_utxos to avoid discrepancies.
+        scan_receive = 10
+        scan_change = 5
+        addresses = _enumerate_addresses(xpub, network, scan_receive, scan_change)
+        utxos: List[Dict] = []
+        for entry in addresses:
+            for utxo in _fetch_address_utxos(entry["address"], network):
+                utxos.append({
+                    "txid": utxo.get("txid", ""),
+                    "vout": utxo.get("vout", 0),
+                    "value_satoshis": utxo.get("value", 0),
+                    "value_btc": utxo.get("value", 0) / 100_000_000,
+                    "address": entry["address"],
+                    "path": entry["path"],
+                    "index": entry["index"],
+                    "change": entry["change"],
+                    "confirmations": utxo.get("status", {}).get("confirmations", 0),
                 })
-
-
-        total_balance = 0
-        total_utxos = 0
-        api_base = "https://blockstream.info/testnet/api" if network == "testnet" else "https://blockstream.info/api"
-
-        for addr_info in addresses:
-            try:
-                response = requests.get(f"{api_base}/address/{addr_info['address']}/utxo", timeout=5)
-                if response.status_code == 200:
-                    utxos = response.json()
-                    for utxo in utxos:
-                        total_balance += utxo.get("value", 0)
-                        total_utxos += 1
-            except:
-                continue
-
+        total_balance = sum(u["value_satoshis"] for u in utxos)
         btc_balance = total_balance / 100_000_000
         coin_type = "1'" if network == "testnet" else "0'"
-
         return {
             "success": True,
             "balance_btc": btc_balance,
             "balance_satoshis": total_balance,
-            "total_utxos": total_utxos,
-            "addresses": addresses,            # llista completa (adreça+path+chain+index)
+            "total_utxos": len(utxos),
+            "utxos": utxos,
+            "addresses": addresses,
             "addresses_checked": len(addresses),
-            "first_address": addresses[0]["address"] if addresses else None,
             "network": network,
             "coin_type": coin_type,
             "derivation_paths": [a["path"] for a in addresses],
-            "derivation_path_template": "path segons prefix (44'/49'/84')"
+            "derivation_path_template": "path segons prefix (44'/49'/84')",
         }
     except Exception as e:
         return {"success": False, "error": str(e)}
@@ -289,49 +354,28 @@ def list_utxos(xpub: str, network: str = "testnet") -> Dict:
     Llista totes les UTXOs (Unspent Transaction Outputs) disponibles.
     """
     try:
-        # Escaneja tant adreces de recepció (chain 0) com de canvi (chain 1)
-        # Mantenim un límit modest per no fer massa crides (es pot ajustar fàcilment)
         scan_receive = 10
-        scan_change = 5  # normalment menys exposades externament
-
-        address_entries: List[Dict] = []
-        for change_flag, limit in ((False, scan_receive), (True, scan_change)):
-            for i in range(limit):
-                info = derive_address_and_path(xpub, network, i, change=change_flag)
-                address_entries.append({
-                    "address": info["address"],
-                    "path": info["path"],
-                    "index": i,
-                    "change": change_flag,
-                })
+        scan_change = 5
+        address_entries = _enumerate_addresses(xpub, network, scan_receive, scan_change)
 
         all_utxos: List[Dict] = []
-        api_base = "https://blockstream.info/testnet/api" if network == "testnet" else "https://blockstream.info/api"
-
         network_errors = 0
         for entry in address_entries:
-            addr = entry["address"]
-            try:
-                response = requests.get(f"{api_base}/address/{addr}/utxo", timeout=5)
-                if response.status_code == 200:
-                    utxos = response.json()
-                    for utxo in utxos:
-                        all_utxos.append({
-                            "txid": utxo.get("txid", ""),
-                            "vout": utxo.get("vout", 0),
-                            "value_satoshis": utxo.get("value", 0),
-                            "value_btc": utxo.get("value", 0) / 100_000_000,
-                            "address": addr,
-                            "path": entry["path"],
-                            "index": entry["index"],
-                            "change": entry["change"],
-                            "confirmations": utxo.get("status", {}).get("confirmations", 0)
-                        })
-                else:
-                    network_errors += 1
-            except Exception:
+            utxos_raw, ok = _fetch_address_utxos_status(entry["address"], network)
+            if not ok:
                 network_errors += 1
-                continue
+            for utxo in utxos_raw:
+                all_utxos.append({
+                    "txid": utxo.get("txid", ""),
+                    "vout": utxo.get("vout", 0),
+                    "value_satoshis": utxo.get("value", 0),
+                    "value_btc": utxo.get("value", 0) / 100_000_000,
+                    "address": entry["address"],
+                    "path": entry["path"],
+                    "index": entry["index"],
+                    "change": entry["change"],
+                    "confirmations": utxo.get("status", {}).get("confirmations", 0),
+                })
 
         total_value_sat = sum(u["value_satoshis"] for u in all_utxos)
         result = {
@@ -344,8 +388,7 @@ def list_utxos(xpub: str, network: str = "testnet") -> Dict:
             "change_addresses_checked": scan_change,
             "network": network,
         }
-        if len(all_utxos) == 0 and network_errors >= (scan_receive + scan_change):
-            # Probably offline / API blocked; surface diagnostic rather than silent empty set
+        if len(all_utxos) == 0 and network_errors == len(address_entries):
             result["note"] = "Cap UTXO retornada i totes les consultes han fallat (possible problema de xarxa o rate-limit)."
             result["network_errors"] = network_errors
         return result
@@ -562,7 +605,14 @@ class BitcoinAIAgent:
     
     def __init__(self, openai_api_key: str = None):
         self.console = Console()
-        
+        # Historial de conversa (memòria simple en procés). Inclou SystemMessage + intercanvis.
+        self._history: List[BaseMessage] = []
+        # Límit màxim de missatges a retenir per evitar creixement indefinit
+        self._history_limit = 40
+        self._memory_enabled = True
+        # Guarda la darrera directiva/instrucció explícita de l'usuari
+        self._last_directive: Optional[str] = None
+
         # Configurar LLM
         api_key = openai_api_key or OPENAI_API_KEY
         if not api_key:
@@ -576,9 +626,6 @@ class BitcoinAIAgent:
             get_fee_rates,
             create_transaction,
             create_transaction_manual,
-            # Nova eina per selecció manual d'UTXOs
-            # (permet especificar exactament quines UTXOs entraràn a la PSBT)
-            
             decode_psbt  # Nova eina
         ]
         
@@ -694,12 +741,49 @@ class BitcoinAIAgent:
     
     async def chat(self, message: str) -> str:
         """Processa un missatge de l'usuari"""
-        
+        lower = message.lower().strip()
+        # Heurística per detectar directiva (imperativa) i guardar-la
+        directive_prefixes = [
+            "crea ", "create ", "fes ", "envia ", "send ", "deriva ", "genera ",
+            "construeix ", "build ", "calcula ", "calcular ", "necessito ", "vull "
+        ]
+        if any(lower.startswith(p) for p in directive_prefixes) or "maximitzar la privacitat" in lower:
+            self._last_directive = message
+
+        # Consultes de recordatori / memòria
+        recall_triggers = [
+            "que he dit abans", "què he dit abans", "que t'he dit abans", "recordes quina es la directiva",
+            "quina es la directiva", "what did i say before", "remember what i asked"
+        ]
+        if any(t in lower for t in recall_triggers):
+            if not self._memory_enabled:
+                return "La memòria està desactivada actualment."
+            # Preparar resposta
+            if self._last_directive:
+                answer = f"La darrera directiva registrada és: '{self._last_directive}'"
+            else:
+                # Recuperar últimes 3 aportacions humanes
+                recent_humans = [m for m in self._history if isinstance(m, HumanMessage)][-3:]
+                if recent_humans:
+                    texts = [m.content for m in recent_humans]
+                    answer = "Resum de les teves últimes indicacions: " + " | ".join(texts)
+                else:
+                    answer = "Encara no tinc cap directiva emmagatzemada."
+            # Actualitzar memòria manualment (afegint aquest intercanvi) perquè bypassaríem el graf
+            if self._memory_enabled:
+                self._history.append(HumanMessage(content=message))
+                self._history.append(AIMessage(content=answer))
+                self._history = self._history[-self._history_limit:]
+            return answer
+
         print(f"[DEBUG] Missatge rebut: {message}")
         print(f"[DEBUG] PSBT Support: {'BIP-174'}")
         
-        # Crear estat inicial
-        initial_messages = [HumanMessage(content=message)]
+        # Construir missatges inicials amb memòria (si activada)
+        if self._memory_enabled and self._history:
+            initial_messages = list(self._history) + [HumanMessage(content=message)]
+        else:
+            initial_messages = [HumanMessage(content=message)]
         
         state = {
             "messages": initial_messages,
@@ -741,22 +825,31 @@ class BitcoinAIAgent:
                         pass
             
             # Obtenir última resposta de l'agent
+            final_response: Optional[str] = None
             for msg in reversed(result["messages"]):
                 if isinstance(msg, AIMessage) and not isinstance(msg, ToolMessage):
                     if hasattr(msg, "tool_calls") and not msg.tool_calls:
-                        response = msg.content
-                        
-                        # Afegir informació sobre el format PSBT si es va crear una transacció
+                        final_response = msg.content
                         if psbt_created:
-                            # Afegim sempre la PSBT completa (sense truncar) per facilitar còpia
-                            response += "\n\n📄 **PSBT creat en format BIP-174 estàndard**"
-                            response += "\nPots signar aquest PSBT amb qualsevol wallet compatible (Electrum, Bitcoin Core, hardware wallets, etc.)"
-                            response += "\n\nPSBT (Base64 completa):\n" + psbt_created + "\n"
-                       
-                        
-                        return response
+                            final_response += "\n\n📄 **PSBT creat en format BIP-174 estàndard**"
+                            final_response += "\nPots signar aquest PSBT amb qualsevol wallet compatible (Electrum, Bitcoin Core, hardware wallets, etc.)"
+                            final_response += "\n\nPSBT (Base64 completa):\n" + psbt_created + "\n"
+                        break
                     elif not hasattr(msg, "tool_calls"):
-                        return msg.content
+                        final_response = msg.content
+                        break
+
+            # Actualitzar memòria (historial) amb els missatges produïts pel graf (abans de retornar)
+            if self._memory_enabled:
+                # El graf retorna tots els messages; mantenim només els últims fins límit
+                # Evitem duplicar exactament la mateixa seqüència (si es repeteix per algun motiu)
+                new_messages = result.get("messages", [])
+                if new_messages:
+                    # Substituir historial complet per l'últim estat (més senzill i robust)
+                    self._history = list(new_messages)[-self._history_limit:]
+            # Si tenim resposta final, retornar-la ara
+            if final_response is not None:
+                return final_response
             
             # Si hi ha resultats de tools però no resposta final
             if tool_results:
@@ -777,6 +870,21 @@ class BitcoinAIAgent:
         psbt_status = "BIP-174 Standard"
         self.console.print(f"[green]✅ Agent configurat amb XPUB per {network}[/green]")
         self.console.print(f"[cyan]📄 PSBT Format: {psbt_status}[/cyan]")
+        # Netejar historial per nova sessió
+        self._history.clear()
+
+    def clear_memory(self):
+        """Buida la memòria conversacional."""
+        self._history.clear()
+
+    def disable_memory(self):
+        """Desactiva l'acumulació de memòria (les interaccions passen a ser stateless)."""
+        self._memory_enabled = False
+        self.clear_memory()
+
+    def enable_memory(self):
+        """Activa la memòria si estava desactivada."""
+        self._memory_enabled = True
 
 # ============== INTERFÍCIE CONVERSACIONAL (manté igual) ==============
 
