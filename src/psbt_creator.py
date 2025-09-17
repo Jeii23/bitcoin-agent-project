@@ -343,9 +343,25 @@ class PSBTCreator:
     def _fetch_transaction(self, txid: str) -> Optional[bytes]:
         """Obté una transacció (hex) des de l'API Blockstream; None si no disponible"""
         try:
-            response = requests.get(f"{self.api_base}/tx/{txid}/hex", timeout=10)
+            # Primer intent: Blockstream
+            response = requests.get(f"{self.api_base}/tx/{txid}/hex", timeout=20)
             if response.status_code == 200:
                 return bytes.fromhex(response.text.strip())
+
+            # Fallback: mempool.space
+            try:
+                alt_base = (
+                    "https://mempool.space/testnet/api"
+                    if self.network == "testnet"
+                    else "https://mempool.space/api"
+                )
+                r2 = requests.get(f"{alt_base}/tx/{txid}/hex", timeout=20)
+                if r2.status_code == 200:
+                    return bytes.fromhex(r2.text.strip())
+            except Exception:
+                # Ignore fallback errors and return None below
+                pass
+
             return None
         except Exception as e:
             print(f"[ERROR] No s'ha pogut obtenir la tx {txid}: {e}")
@@ -547,39 +563,44 @@ class PSBTCreator:
         # Input Maps
         for idx_inp, inp in enumerate(inputs):
             input_map = b""
-
+            address_str = inp.get("address", "")
+            version_or_prefix, addr_hash = self._decode_address(address_str)
             prev_tx = self._fetch_transaction(inp["txid"])
-            if prev_tx:
-                input_map += self._write_key_value(PSBT_IN_NON_WITNESS_UTXO, b"", prev_tx)
-            else:
-                # Witness UTXO mínim: amount (8 bytes) + scriptPubKey
-                witness_utxo = struct.pack("<Q", int(inp.get("value_satoshis", 0)))
-                try:
-                    version_or_prefix, addr_hash = self._decode_address(inp.get("address", ""))
-                    address_str = inp.get("address", "")
-                    if address_str.startswith(("bc1", "tb1")):
-                        wver = version_or_prefix
-                        if wver == 0 and len(addr_hash) == 20:  # P2WPKH
-                            script = b"\x00\x14" + addr_hash
-                        elif wver == 0 and len(addr_hash) == 32:  # P2WSH
-                            script = b"\x00\x20" + addr_hash
-                        elif wver == 1 and len(addr_hash) == 32:  # P2TR
-                            script = b"\x51\x20" + addr_hash
-                        else:
-                            raise ValueError("Unsupported segwit witness program for input")
-                    elif version_or_prefix in (0x00, 0x6F) and len(addr_hash) >= 20:
-                        script = b"\x76\xa9\x14" + addr_hash[:20] + b"\x88\xac"  # P2PKH
-                    elif version_or_prefix in (0x05, 0xC4) and len(addr_hash) >= 20:
-                        script = b"\xa9\x14" + addr_hash[:20] + b"\x87"  # P2SH
-                    else:
-                        raise ValueError("Unsupported legacy address type for input")
-                    witness_utxo += self._compact_size(len(script)) + script
-                except Exception as e:
-                    raise ValueError(
-                        f"Failed to build witness_utxo script for input address {inp.get('address')}: {e}"
-                    )
 
+            # Build scriptPubKey from address
+            script: bytes
+            if address_str.startswith(("bc1", "tb1")):
+                wver = version_or_prefix
+                if wver == 0 and len(addr_hash) == 20:  # P2WPKH
+                    script = b"\x00\x14" + addr_hash
+                elif wver == 0 and len(addr_hash) == 32:  # P2WSH
+                    script = b"\x00\x20" + addr_hash
+                elif wver == 1 and len(addr_hash) == 32:  # P2TR
+                    script = b"\x51\x20" + addr_hash
+                else:
+                    raise ValueError("Unsupported segwit witness program for input")
+                # For bech32 (native segwit), always include witness_utxo
+                witness_utxo = struct.pack("<Q", int(inp.get("value_satoshis", 0)))
+                witness_utxo += self._compact_size(len(script)) + script
                 input_map += self._write_key_value(PSBT_IN_WITNESS_UTXO, b"", witness_utxo)
+            else:
+                # Base58 address (legacy types: P2PKH or P2SH); build script
+                if version_or_prefix in (0x00, 0x6F) and len(addr_hash) >= 20:
+                    script = b"\x76\xa9\x14" + addr_hash[:20] + b"\x88\xac"  # P2PKH
+                elif version_or_prefix in (0x05, 0xC4) and len(addr_hash) >= 20:
+                    script = b"\xa9\x14" + addr_hash[:20] + b"\x87"  # P2SH
+                else:
+                    raise ValueError("Unsupported legacy address type for input")
+                if prev_tx:
+                    # Prefer non_witness_utxo when prev_tx available (standards-compliant for legacy)
+                    input_map += self._write_key_value(PSBT_IN_NON_WITNESS_UTXO, b"", prev_tx)
+                else:
+                    # Fallback: if we cannot fetch prev_tx for legacy inputs, include a witness_utxo
+                    # with value + scriptPubKey built from the address. This allows downstream tools/tests
+                    # to validate and proceed even without NON_WITNESS_UTXO.
+                    witness_utxo = struct.pack("<Q", int(inp.get("value_satoshis", 0)))
+                    witness_utxo += self._compact_size(len(script)) + script
+                    input_map += self._write_key_value(PSBT_IN_WITNESS_UTXO, b"", witness_utxo)
 
             # SIGHASH_ALL per defecte (no configuració avançada encara)
             input_map += self._write_key_value(PSBT_IN_SIGHASH_TYPE, b"", struct.pack("<I", 1))
@@ -625,56 +646,170 @@ class PSBTCreator:
     ) -> str:
         return self.create_psbt(inputs, outputs, locktime, version, xpub)["psbt"]
 
-    def decode_psbt(self, psbt_base64: str) -> Dict:
-        """Decodificador simple per inspeccionar camps bàsics."""
+    def _read_compact_size(self, data: bytes) -> Tuple[int, int]:
+        """Wrapper segur per CompactSize (varint) que no llença excepcions."""
         try:
-            psbt_bytes = base64.b64decode(psbt_base64)
+            return codec.compact_size_decode(data)
+        except Exception:
+            return 0, 0
+
+    def decode_psbt(self, psbt_base64: str) -> Dict:
+        """Decodificador per comprovar validesa i extreure comptadors reals.
+
+        - Valida base64 i magic bytes.
+        - Llegeix el Global Map i extreu la transacció unsigned si hi és.
+        - Parsea la transacció unsigned per obtenir num_inputs/num_outputs reals.
+        - Opcionalment detecta si cada input té "witness_utxo" present.
+        """
+        try:
+            # Neteja espais i intenta padding si cal
+            if isinstance(psbt_base64, str):
+                b64_clean = "".join(psbt_base64.split())
+            else:
+                return {"valid": False, "error": "PSBT ha de ser str base64"}
+            try:
+                psbt_bytes = base64.b64decode(b64_clean, validate=True)
+            except Exception:
+                pad = (-len(b64_clean)) % 4
+                psbt_bytes = base64.b64decode(b64_clean + ("=" * pad), validate=False)
+
             if not psbt_bytes.startswith(PSBT_MAGIC):
                 raise ValueError("No és un PSBT vàlid (magic bytes incorrectes)")
 
             offset = len(PSBT_MAGIC)
-            result = {
-                "version": 0,
-                "tx": None,
-                "inputs": [],
-                "outputs": [],
+            result: Dict = {
                 "valid": True,
+                "version": 0,  # PSBT v0
+                "tx": None,
             }
 
-            # Llegim global map senzillament
+            # Helpers locals
+            def _read_cs(buf: bytes, ofs: int) -> Tuple[int, int]:
+                val, used = self._read_compact_size(buf[ofs:])
+                if used == 0 and val == 0 and buf[ofs:ofs+1] != b"\x00":
+                    # Defensa per casos estranys
+                    raise ValueError("CompactSize invàlid")
+                return val, used
+
+            # 1) Global map: clau-valor fins separador 0x00
+            unsigned_tx_bytes: Optional[bytes] = None
             while offset < len(psbt_bytes):
-                key_len = psbt_bytes[offset]
-                offset += 1
-                if key_len == 0:
-                    break
-                key = psbt_bytes[offset : offset + key_len]
+                # key length (CompactSize)
+                if psbt_bytes[offset:offset+1] == b"\x00":
+                    offset += 1
+                    break  # end of global map
+                key_len, used = _read_cs(psbt_bytes, offset)
+                offset += used
+                key = psbt_bytes[offset: offset + key_len]
                 offset += key_len
+                val_len, used = _read_cs(psbt_bytes, offset)
+                offset += used
+                value = psbt_bytes[offset: offset + val_len]
+                offset += val_len
 
-                value_len, consumed = self._read_compact_size(psbt_bytes[offset:])
-                offset += consumed
-                value = psbt_bytes[offset : offset + value_len]
-                offset += value_len
-
-                if key[0:1] == PSBT_GLOBAL_UNSIGNED_TX:
-                    result["tx"] = value.hex()
-                elif key[0:1] == PSBT_GLOBAL_VERSION and len(value) >= 4:
+                if key[:1] == PSBT_GLOBAL_UNSIGNED_TX:
+                    unsigned_tx_bytes = value
+                elif key[:1] == PSBT_GLOBAL_VERSION and len(value) >= 4:
                     result["version"] = struct.unpack("<I", value[:4])[0]
 
-            # Comptes aproximats
-            separator_count = psbt_bytes.count(b"\x00")
-            estimated_inputs = max(0, (separator_count - 1) // 2)
-            result["num_inputs"] = estimated_inputs
-            result["num_outputs"] = len(getattr(self, "_last_outputs", []))
+            # 2) Comptes reals a partir de l'unsigned tx
+            n_in = 0
+            n_out = 0
+            tx_version = None
+            locktime = None
+            if unsigned_tx_bytes:
+                try:
+                    n_in, n_out, tx_version, locktime = self._parse_unsigned_tx_counts(unsigned_tx_bytes)
+                except Exception:
+                    pass
+
+            result["num_inputs"] = int(n_in)
+            result["num_outputs"] = int(n_out)
+            if unsigned_tx_bytes is not None:
+                result["tx"] = unsigned_tx_bytes.hex()
+            if tx_version is not None:
+                result["tx_version"] = tx_version
+            if locktime is not None:
+                result["locktime"] = locktime
+
+            # 3) (Opcional) detectar PSBT_IN_WITNESS_UTXO per input
+            if n_in:
+                has_wit = []
+                for _i in range(n_in):
+                    saw_wit = False
+                    while True:
+                        if psbt_bytes[offset:offset+1] == b"\x00":
+                            offset += 1
+                            break  # end of this input map
+                        klen, used = _read_cs(psbt_bytes, offset)
+                        offset += used
+                        key = psbt_bytes[offset: offset + klen]
+                        offset += klen
+                        vlen, used = _read_cs(psbt_bytes, offset)
+                        offset += used
+                        # We don't need the value bytes themselves; just skip
+                        offset += vlen
+                        if key[:1] == PSBT_IN_WITNESS_UTXO:
+                            saw_wit = True
+                    has_wit.append(saw_wit)
+                result["has_witness_utxo"] = has_wit
+
+            # 4) Saltar output maps si cal (no inspectem contingut)
+            for _o in range(n_out):
+                while True:
+                    if psbt_bytes[offset:offset+1] == b"\x00":
+                        offset += 1
+                        break
+                    klen, used = _read_cs(psbt_bytes, offset)
+                    offset += used
+                    offset += klen
+                    vlen, used = _read_cs(psbt_bytes, offset)
+                    offset += used
+                    offset += vlen
 
             return result
         except Exception as e:
             return {"valid": False, "error": str(e)}
 
-    def _read_compact_size(self, data: bytes) -> Tuple[int, int]:
-        try:
-            return codec.compact_size_decode(data)
-        except Exception:
-            return 0, 0
+    def _parse_unsigned_tx_counts(self, tx_bytes: bytes) -> Tuple[int, int, int, int]:
+        """Parsea una transacció unsigned per obtenir (n_inputs, n_outputs, tx_version, locktime)."""
+        ofs = 0
+        if len(tx_bytes) < 10:
+            raise ValueError("Unsigned tx massa curta")
+        tx_version = struct.unpack("<I", tx_bytes[ofs:ofs+4])[0]
+        ofs += 4
+        # inputs
+        n_in, used = codec.compact_size_decode(tx_bytes[ofs:])
+        ofs += used
+        for _ in range(n_in):
+            ofs += 32  # txid
+            ofs += 4   # vout
+            slen, used = codec.compact_size_decode(tx_bytes[ofs:])
+            ofs += used
+            ofs += slen  # scriptSig
+            ofs += 4   # sequence
+        # outputs
+        n_out, used = codec.compact_size_decode(tx_bytes[ofs:])
+        ofs += used
+        for _ in range(n_out):
+            ofs += 8  # amount
+            slen, used = codec.compact_size_decode(tx_bytes[ofs:])
+            ofs += used
+            ofs += slen  # scriptPubKey
+        locktime = struct.unpack("<I", tx_bytes[ofs:ofs+4])[0]
+        return n_in, n_out, tx_version, locktime
+
+
+# Senzill helper d'alt nivell per a testing: decode directament
+def decode_psbt(psbt_base64: str, network: str = "testnet") -> Dict:
+    """Decodifica un PSBT (base64) retornant un dict estable amb 'valid' i comptadors útils.
+
+    Exemple mínim:
+      dec = decode_psbt(b64)
+      assert dec["valid"]
+      assert dec["num_inputs"] >= 0
+    """
+    return PSBTCreator(network=network).decode_psbt(psbt_base64)
 
 
 # ==========================

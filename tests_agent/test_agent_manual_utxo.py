@@ -66,6 +66,23 @@ def test_agent_manual_utxo_prompt_flow():
                 break
         assert chosen_psbt, "Cap PSBT vàlida detectada (totes truncades?)"
         print("PSBT detectada (inici):", chosen_psbt[:60], "...")
+        # Valida amb el nostre decoder per assegurar compatibilitat Electrum
+        import sys as _sys
+        from pathlib import Path as _Path
+        if str(_Path(__file__).resolve().parent.parent / 'src') not in _sys.path:
+            _sys.path.append(str(_Path(__file__).resolve().parent.parent / 'src'))
+        from psbt_creator import decode_psbt  # type: ignore
+        dec = decode_psbt(chosen_psbt, network=NETWORK)
+        assert dec.get("valid", False), dec
+        assert dec.get("num_inputs", 0) >= 1
+        assert dec.get("num_outputs", 0) >= 1
+        # Fitxers han de existir i coincidir
+        assert Path("psbt_latest.base64").exists(), "psbt_latest.base64 no existeix"
+        assert Path("psbt_latest.psbt").exists(), "psbt_latest.psbt no existeix"
+        saved_b64 = Path("psbt_latest.base64").read_text().strip()
+        assert "\n" not in saved_b64 and saved_b64.startswith("cHNidP")
+        saved_raw = Path("psbt_latest.psbt").read_bytes()
+        assert saved_raw.startswith(b"psbt\xff")
 
     asyncio.run(_run())
     print("===============================================================\n")

@@ -33,6 +33,13 @@ def test_decode_psbt_roundtrip():
     if "outputs" in decoded:
         assert isinstance(decoded["outputs"], list)
 
+    # Ensure witness utxo presence is reported and matches input count (Electrum expects WITNESS_UTXO for segwit inputs)
+    if decoded.get("num_inputs", 0) > 0:
+        has_wit = decoded.get("has_witness_utxo")
+        assert isinstance(has_wit, list) and len(has_wit) == decoded["num_inputs"]
+        # Allow legacy cases but prefer all True for our segwit vectors
+        assert all(isinstance(x, bool) for x in has_wit)
+
 def test_psbt_magic_prefix_base64():
     import psbt_creator
     b64 = "cHNidP8BAHE="  # 'psbt\xff\x01\x01q' - just checks base64 handling

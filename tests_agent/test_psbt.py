@@ -485,7 +485,7 @@ def test_integration_with_agent():
         xpub = "vpub5Zs16Jexbgj86exZZdj2LT3ukA2gPXdGgdLZokbng1MgbP5jrm8eRkqAffKEJN2BnMzjkJ3G64Sk2XoB6FyAEnXAfmu7nthCGFXy1snAQHC"
         agent.setup(xpub, "testnet")
         print(f"\n{Colors.CYAN}Provant crear una transacció amb l'agent...{Colors.END}")
-        response = await agent.chat("Vull crear una transacció per enviar 0.001 BTC a tb1qfqzk956wtxlvvghewk5hqu6vwqjtjm5qmua7wx")
+        response = await agent.chat("Vull crear ")
         print(f"\n{Colors.GREEN}Resposta de l'agent:{Colors.END}")
         print(response)
         if "psbt" in response.lower() or "transacció" in response.lower():

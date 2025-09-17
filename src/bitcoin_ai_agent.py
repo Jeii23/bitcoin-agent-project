@@ -8,6 +8,8 @@ import asyncio
 import os
 import json
 import hashlib
+import base64
+import re
 import base58
 from typing import TypedDict, List, Dict, Optional, Literal, Annotated, Sequence
 from decimal import Decimal
@@ -55,6 +57,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.prompt import Prompt
 from rich import print as rprint
+from rich.text import Text
 
 # ============== CONFIGURACIÓ ==============
 
@@ -79,6 +82,96 @@ if DEFAULT_NETWORK not in ["mainnet", "testnet"]:
     DEFAULT_NETWORK = "testnet"
 
     # ============== HELPER ==============
+
+# Guarda l'últim missatge de l'usuari per poder corregir adreces mal parsejades pel LLM
+_LAST_USER_UTTERANCE: str = ""
+_LAST_RECIPIENT_ADDRESS: Optional[str] = None
+
+# Regex per candidates d'adreça (bech32 o base58 típiques)
+_ADDR_RE = re.compile(r"(bc1[0-9a-z]{8,}|tb1[0-9a-z]{8,}|[13][a-km-zA-HJ-NP-Z1-9]{25,})", re.IGNORECASE)
+
+def _find_first_valid_address_in_text(text: str, network: str) -> Optional[str]:
+    """Troba la primera adreça vàlida dins d'un text lliure validant checksum/format.
+
+    Retorna l'adreça o None si no en troba cap vàlida.
+    """
+    if not text:
+        return None
+    creator = PSBTCreator(network=network)
+    for m in _ADDR_RE.finditer(text):
+        cand = m.group(0)
+        try:
+            # Validació forta via decodificador d'adreces
+            _ = creator._decode_address(cand)
+            return cand
+        except Exception:
+            continue
+    return None
+
+
+def _normalize_address(addr: Optional[str]) -> Optional[str]:
+    """Best-effort normalization for user/LLM-provided addresses.
+
+    - Strips surrounding whitespace and common quotes/brackets.
+    - Removes zero-width and non-breaking spaces.
+    - Removes any embedded whitespace characters.
+    - Returns None if input is falsy.
+    """
+    if not addr:
+        return addr
+    s = str(addr)
+    # Strip surrounding whitespace and common punctuation wrappers
+    s = s.strip().strip("’‘'\"“”<>[](){}.,:;`“”")
+    # Remove zero-width and NBSP variants
+    for ch in ("\u200b", "\ufeff", "\u2060", "\u00A0"):
+        s = s.replace(ch.encode('utf-8').decode('unicode_escape'), "") if ch.startswith("\\u") else s.replace(ch, "")
+    # Collapse/remove any whitespace inside
+    s = re.sub(r"\s+", "", s)
+    return s
+
+
+def _sanitize_psbt_b64(b64_text: str) -> str:
+    """Sanitize a PSBT base64 string by removing whitespace and validating magic bytes.
+
+    Returns the cleaned single-line base64. Raises ValueError if decode fails or magic missing.
+    """
+    if not isinstance(b64_text, str):
+        raise ValueError("PSBT must be a base64 string")
+    # Remove all whitespace/newlines
+    cleaned = re.sub(r"\s+", "", b64_text)
+    # Validate by decoding and checking magic "psbt\x00"
+    try:
+        raw = base64.b64decode(cleaned, validate=True)
+    except Exception as e:
+        # Some providers wrap without padding; try add padding
+        pad = (-len(cleaned)) % 4
+        try:
+            raw = base64.b64decode(cleaned + ("=" * pad), validate=False)
+        except Exception:
+            raise ValueError(f"Invalid PSBT base64: {e}")
+    if not (len(raw) >= 5 and raw[:5] == b"psbt\xff"):
+        raise ValueError("Decoded PSBT missing magic 'psbt\\xff'")
+    return cleaned
+
+
+def _replace_psbt_in_text(text: str, clean_psbt: str) -> str:
+    """Replace any PSBT-like base64 blobs in free-form text with the provided clean one-liner.
+
+    Note: Historically, the LLM could emit a PSBT inline followed immediately by natural text (e.g., '==és').
+    To avoid copy/paste issues, first strip any PSBT-like blobs entirely and later append a standardized
+    section with a single clean PSBT on its own line.
+    """
+    if not text:
+        return text
+    pattern = re.compile(r"cHNidP[0-9A-Za-z+/=\s]+")
+    # Remove all PSBT-like blobs to prevent duplicates or adjacent-text artifacts
+    return pattern.sub("[PSBT ocultada; consulta la secció estandarditzada de PSBT més avall]", text)
+
+def _count_psbt_blobs(text: str) -> int:
+    """Counts occurrences of PSBT-like base64 blobs in text."""
+    if not text:
+        return 0
+    return len(re.findall(r"cHNidP[0-9A-Za-z+/=\s]+", text))
 
 
 def _address_has_history(address: str, network: str) -> bool:
@@ -458,6 +551,26 @@ def create_transaction(
                 )
                 fee_rate = new_rate
 
+        # Si l'usuari respon amb confirmació sense repetir l'adreça, reutilitza la darrera coneguda
+        if not recipient_address:
+            global _LAST_RECIPIENT_ADDRESS
+            if isinstance(_LAST_RECIPIENT_ADDRESS, str) and _LAST_RECIPIENT_ADDRESS:
+                recipient_address = _LAST_RECIPIENT_ADDRESS
+        # Correcció defensiva de l'adreça de destí si el LLM o l'input CLI l'ha corromput
+        try:
+            recipient_address = _normalize_address(recipient_address) or recipient_address
+            PSBTCreator(network=network)._decode_address(recipient_address)
+        except Exception:
+            # Intenta extreure una adreça vàlida del darrer missatge de l'usuari
+            cand = _find_first_valid_address_in_text(_LAST_USER_UTTERANCE, network)
+            if cand:
+                recipient_address = _normalize_address(cand) or cand
+            else:
+                return {
+                    "success": False,
+                    "error": f"Invalid recipient/change address: {recipient_address} (cap adreça vàlida detectada al missatge de l'usuari)",
+                }
+
         # Obtenir UTXOs
         utxos_result = list_utxos.invoke({"xpub": xpub, "network": network})
         if not utxos_result["success"]:
@@ -564,6 +677,25 @@ def create_transaction_manual(
     3. Passa-les a create_transaction_psbt com manual_selected_utxos.
     """
     try:
+        # Si l'usuari confirma sense repetir l'adreça, reutilitza la darrera coneguda
+        if not recipient_address:
+            global _LAST_RECIPIENT_ADDRESS
+            if isinstance(_LAST_RECIPIENT_ADDRESS, str) and _LAST_RECIPIENT_ADDRESS:
+                recipient_address = _LAST_RECIPIENT_ADDRESS
+        # Correcció defensiva de l'adreça de destí si el LLM o l'input CLI l'ha corromput
+        try:
+            recipient_address = _normalize_address(recipient_address) or recipient_address
+            PSBTCreator(network=network)._decode_address(recipient_address)
+        except Exception:
+            cand = _find_first_valid_address_in_text(_LAST_USER_UTTERANCE, network)
+            if cand:
+                recipient_address = _normalize_address(cand) or cand
+            else:
+                return {
+                    "success": False,
+                    "error": f"Invalid recipient/change address: {recipient_address} (cap adreça vàlida detectada al missatge de l'usuari)",
+                }
+
         utxos_result = list_utxos.invoke({"xpub": xpub, "network": network})
         if not utxos_result.get("success"):
             return utxos_result
@@ -572,7 +704,21 @@ def create_transaction_manual(
         selected = [u for u in all_utxos if f"{u.get('txid')}:{u.get('vout')}" in wanted]
         missing = wanted - {f"{u.get('txid')}:{u.get('vout')}" for u in selected}
         if not selected:
-            return {"success": False, "error": "Cap UTXO trobada entre les especificades", "missing": list(missing)}
+            # Fallback: si l'LLM ha proporcionat UTXOs inexistents, reverteix a selecció automàtica
+            auto = create_transaction_psbt(
+                xpub=xpub,
+                recipient_address=recipient_address,
+                amount_btc=amount_btc,
+                utxos=all_utxos,
+                change_address=derive_address_and_path(xpub, network, index=change_index, change=True)["address"],
+                network=network,
+                fee_rate=fee_rate,
+            )
+            if auto.get("success"):
+                auto["selection_mode"] = "auto_fallback"
+                auto["requested_utxos"] = utxo_ids
+                auto["missing"] = list(missing)
+            return auto
 
         # Derivar adreça de canvi (canvi index configurable)
         change_info = derive_address_and_path(xpub, network, index=change_index, change=True)
@@ -717,6 +863,16 @@ class BitcoinAIAgent:
                     # Si es crea una transacció, guardar el PSBT
                     if tc['name'] == 'create_transaction':
                         state["last_psbt"] = "pending"
+                    # Persistir la darrera adreça de destí proposada per reús en confirmacions
+                    try:
+                        if tc['name'] in ('create_transaction', 'create_transaction_manual'):
+                            args = tc.get('args') or {}
+                            ra = args.get('recipient_address')
+                            if ra:
+                                global _LAST_RECIPIENT_ADDRESS
+                                _LAST_RECIPIENT_ADDRESS = _normalize_address(ra) or ra
+                    except Exception:
+                        pass
             
             state["messages"].append(response)
             
@@ -741,6 +897,8 @@ class BitcoinAIAgent:
     
     async def chat(self, message: str) -> str:
         """Processa un missatge de l'usuari"""
+        global _LAST_USER_UTTERANCE
+        _LAST_USER_UTTERANCE = message
         lower = message.lower().strip()
         # Heurística per detectar directiva (imperativa) i guardar-la
         directive_prefixes = [
@@ -814,13 +972,53 @@ class BitcoinAIAgent:
             for msg in result["messages"]:
                 if isinstance(msg, ToolMessage):
                     tool_results.append(msg.content)
+                    try:
+                        print(f"[DEBUG] ToolMessage content type: {type(msg.content)}")
+                        preview = str(msg.content)
+                        if len(preview) > 200:
+                            preview = preview[:200] + "..."
+                        print(f"[DEBUG] ToolMessage content preview: {preview}")
+                    except Exception:
+                        pass
                     # Buscar si s'ha creat un PSBT
                     try:
-                        content = json.loads(msg.content) if isinstance(msg.content, str) else msg.content
-                        if isinstance(content, dict) and "psbt" in content:
-                            psbt_created = content.get("psbt")
+                        # Normalitza contingut de ToolMessage (pot ser str JSON, dict o llista segmentada)
+                        raw = msg.content
+                        content = json.loads(raw) if isinstance(raw, str) else raw
+                        def _extract_psbt(obj) -> Optional[str]:
+                            if isinstance(obj, dict) and "psbt" in obj:
+                                return obj.get("psbt")
+                            # Alguns frameworks encapsulen en claus com 'content' o 'json'
+                            if isinstance(obj, dict):
+                                for k in ("content", "json", "data"):
+                                    v = obj.get(k)
+                                    if isinstance(v, str):
+                                        try:
+                                            jd = json.loads(v)
+                                            if isinstance(jd, dict) and "psbt" in jd:
+                                                return jd.get("psbt")
+                                        except Exception:
+                                            continue
+                                    elif isinstance(v, dict) and "psbt" in v:
+                                        return v.get("psbt")
+                            if isinstance(obj, list):
+                                for it in obj:
+                                    r = _extract_psbt(it)
+                                    if r:
+                                        return r
+                            return None
+                        found = _extract_psbt(content)
+                        if found:
+                            psbt_created = found
                             self.last_psbt = psbt_created
-                            print(f"[DEBUG] PSBT guardat: {psbt_created[:50] if psbt_created else 'None'}...")
+                            # Evita imprimir el PSBT complet per pantalla per no forçar salts de línia
+                            try:
+                                _pv = psbt_created if isinstance(psbt_created, str) else str(psbt_created)
+                                if len(_pv) > 120:
+                                    _pv = _pv[:120] + "…"
+                                print(f"[DEBUG] PSBT guardat (preview): {_pv}")
+                            except Exception:
+                                pass
                     except:
                         pass
             
@@ -831,9 +1029,41 @@ class BitcoinAIAgent:
                     if hasattr(msg, "tool_calls") and not msg.tool_calls:
                         final_response = msg.content
                         if psbt_created:
-                            final_response += "\n\n📄 **PSBT creat en format BIP-174 estàndard**"
-                            final_response += "\nPots signar aquest PSBT amb qualsevol wallet compatible (Electrum, Bitcoin Core, hardware wallets, etc.)"
-                            final_response += "\n\nPSBT (Base64 completa):\n" + psbt_created + "\n"
+                            # Netejar qualsevol espai/blanc accidental i validar via decodificador intern
+                            clean_psbt = _sanitize_psbt_b64(psbt_created)
+                            try:
+                                dec = PSBTCreator(network=self.network).decode_psbt(clean_psbt)
+                            except Exception as _e_dec:
+                                dec = {"valid": False, "error": str(_e_dec)}
+
+                            if not dec.get("valid", False):
+                                # No publiquem una PSBT potencialment corrupta; oferim diagnòstic
+                                final_response = _replace_psbt_in_text(final_response, "")
+                                final_response += "\n\n⚠️ No s'ha pogut validar la PSBT generada amb el decodificador intern."
+                                final_response += f"\nDetalls: {dec.get('error', 'desconegut')}\n"
+                            else:
+                                # Assegura que qualsevol bloc anterior (multi-línia) al text es retirat
+                                final_response = _replace_psbt_in_text(final_response, clean_psbt)
+                                try:
+                                    # Escriure arxius per ús fàcil a wallets
+                                    Path("psbt_latest.psbt").write_bytes(base64.b64decode(clean_psbt))
+                                    Path("psbt_latest.base64").write_text(clean_psbt)
+                                except Exception as _e:
+                                    print(f"[WARN] No s'ha pogut escriure fitxer PSBT: {_e}")
+
+                                # Afegeix una secció estandarditzada, amb la PSBT aïllada en línia pròpia i línia en blanc després
+                                final_response += "\n\n📄 **PSBT creat en format BIP-174 estàndard**"
+                                final_response += "\nPots signar aquest PSBT amb qualsevol wallet compatible (Electrum, Bitcoin Core, hardware wallets, etc.)"
+                                final_response += "\nElectrum: usa Tools > Load transaction > From text i enganxa el PSBT en Base64, o File > Open/Load transaction > From file amb psbt_latest.psbt (no el peguis com a HEX)."
+                                final_response += "\nFitxers guardats: psbt_latest.psbt (binari) i psbt_latest.base64 (text)."
+                                final_response += "\n\nPSBT (Base64 una sola línia, sense salts):\n" + clean_psbt + "\n\n"
+                                # Debug defensiu: assegurar que només queda una PSBT al text final
+                                try:
+                                    cnt = _count_psbt_blobs(final_response)
+                                    if cnt > 1:
+                                        print(f"[WARN] S'han detectat {cnt} PSBTs al text final; això no hauria de passar")
+                                except Exception:
+                                    pass
                         break
                     elif not hasattr(msg, "tool_calls"):
                         final_response = msg.content
@@ -932,9 +1162,47 @@ class BitcoinAssistant:
             # Processar amb l'agent
             with self.console.status("[dim]Pensant...[/dim]"):
                 response = await self.agent.chat(user_input)
-            
-            # Mostrar resposta
-            self.console.print(f"\n[bold green]🤖 Agent[/bold green]: {response}\n")
+
+            # Mostrar resposta: assegurem que la línia PSBT es mostra sense wrapping dur
+            try:
+                marker = "PSBT (Base64 una sola línia, sense salts):"
+                if isinstance(response, str) and marker in response:
+                    head, tail = response.split(marker, 1)
+                    # capçalera + marcador
+                    self.console.print(f"\n[bold green]🤖 Agent[/bold green]: {head}{marker}")
+                    # primera línia no buida després del marcador és la PSBT
+                    tail_lines = tail.splitlines()
+                    psbt_line = ""
+                    rem_start = 0
+                    for i, ln in enumerate(tail_lines):
+                        if ln.strip():
+                            psbt_line = ln.strip()
+                            rem_start = i + 1
+                            break
+                    if psbt_line:
+                        # sanitzar i validar mínimament, però si falla imprimeix tal qual
+                        try:
+                            psbt_line = _sanitize_psbt_b64(psbt_line)
+                        except Exception:
+                            pass
+                        # Imprimir en brut a stdout per evitar qualsevol format/espai injectat per la consola
+                        try:
+                            print(psbt_line, flush=True)
+                            # línia en blanc per separar de la resta i evitar que Rich afegeixi padding a la mateixa línia
+                            print("")
+                        except Exception:
+                            # fallback a rich si hi ha cap problema amb stdout
+                            self.console.print(Text(psbt_line, no_wrap=True, overflow="ignore"))
+                    remainder = "\n".join(tail_lines[rem_start:])
+                    if remainder:
+                        # imprimiu la resta en brut també
+                        print(remainder + "\n")
+                    else:
+                        self.console.print("")
+                else:
+                    self.console.print(f"\n[bold green]🤖 Agent[/bold green]: {response}\n")
+            except Exception:
+                self.console.print(f"\n[bold green]🤖 Agent[/bold green]: {response}\n")
     
     async def setup(self):
         """Configura l'agent"""
