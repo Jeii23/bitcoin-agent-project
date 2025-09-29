@@ -51,6 +51,7 @@ except ImportError:
 
 # IMPORTAR EL NOU CREADOR DE PSBT
 from psbt_creator import PSBTCreator, create_transaction_psbt
+from addressing import detect_address_type  # lightweight helper for input type checks
 
 # Per la interfície
 from rich.console import Console
@@ -68,6 +69,9 @@ load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 DEFAULT_XPUB = os.getenv("BITCOIN_XPUB", "")
 DEFAULT_NETWORK = os.getenv("BITCOIN_NETWORK", "testnet").lower()
+DEFAULT_PRIVACY_PRESET = (os.getenv("BITCOIN_PRIVACY_PRESET", "max") or "max").lower()
+if DEFAULT_PRIVACY_PRESET not in ("max", "none"):
+    DEFAULT_PRIVACY_PRESET = "max"
 
 # Verificar que tenim la clau d'OpenAI
 if not OPENAI_API_KEY or OPENAI_API_KEY == "your-key-here":
@@ -174,6 +178,23 @@ def _count_psbt_blobs(text: str) -> int:
     return len(re.findall(r"cHNidP[0-9A-Za-z+/=\s]+", text))
 
 
+def _provider_sequence(network: str):
+        """Return ordered list of (provider_name, base_url) based on BLOCKCHAIN_API env.
+
+        BLOCKCHAIN_API values:
+            - "blockstream": prefer Blockstream, fallback to Mempool
+            - "mempool": prefer Mempool, fallback to Blockstream
+            - other/"auto": same as blockstream preference
+        """
+        pref = os.getenv("BLOCKCHAIN_API", "auto").lower()
+        bs = ("blockstream", "https://blockstream.info/testnet/api" if network == "testnet" else "https://blockstream.info/api")
+        mp = ("mempool", "https://mempool.space/testnet/api" if network == "testnet" else "https://mempool.space/api")
+        if pref == "mempool":
+                return [mp, bs]
+        # default and "blockstream"
+        return [bs, mp]
+
+
 def _address_has_history(address: str, network: str) -> bool:
     """Best-effort check of whether an address has ever received funds.
 
@@ -184,29 +205,31 @@ def _address_has_history(address: str, network: str) -> bool:
       3. On total failure, return False so address can still be offered; this
          restores prior UX where first unused appeared earlier instead of jumping ahead.
     """
-    api_base = "https://blockstream.info/testnet/api" if network == "testnet" else "https://blockstream.info/api"
-    try:
-        r = requests.get(f"{api_base}/address/{address}", timeout=6)
-        if r.status_code == 200:
-            info = r.json() or {}
-            chain = info.get("chain_stats", {}) or {}
-            memp = info.get("mempool_stats", {}) or {}
-            funded = chain.get("funded_txo_count", 0) + memp.get("funded_txo_count", 0)
-            return funded > 0
-        # fallback lightweight
-        r2 = requests.get(f"{api_base}/address/{address}/utxo", timeout=4)
-        if r2.status_code == 200:
-            return len(r2.json()) > 0
-        return False
-    except Exception:
-        # Network uncertainty: treat as unused (False) to avoid skipping deterministic indices.
-        return False
+    providers = _provider_sequence(network)
+    for _name, base in providers:
+        try:
+            r = requests.get(f"{base}/address/{address}", timeout=6)
+            if r.status_code == 200:
+                info = r.json() or {}
+                chain = info.get("chain_stats", {}) or {}
+                memp = info.get("mempool_stats", {}) or {}
+                funded = chain.get("funded_txo_count", 0) + memp.get("funded_txo_count", 0)
+                return funded > 0
+            # fallback lightweight for this provider
+            r2 = requests.get(f"{base}/address/{address}/utxo", timeout=4)
+            if r2.status_code == 200:
+                return len(r2.json()) > 0
+        except Exception:
+            pass
+    # All providers failed or returned non-200
+    return False
 
 
 # ================= SHARED UTXO SCAN HELPERS =================
 
 def _api_base(network: str) -> str:
-    return "https://blockstream.info/testnet/api" if network == "testnet" else "https://blockstream.info/api"
+    # Back-compat: keep a single base (primary) for simple callers
+    return _provider_sequence(network)[0][1]
 
 
 def _fetch_address_utxos(address: str, network: str, timeout: float = 5.0, retries: int = 2) -> List[Dict]:
@@ -214,18 +237,19 @@ def _fetch_address_utxos(address: str, network: str, timeout: float = 5.0, retri
 
     Returns empty list if all attempts fail (never raises) to keep deterministic higher-level code.
     """
-    base = _api_base(network)
     last_error: Optional[Exception] = None
+    providers = _provider_sequence(network)
     for attempt in range(retries + 1):
-        try:
-            r = requests.get(f"{base}/address/{address}/utxo", timeout=timeout)
-            if r.status_code == 200:
-                data = r.json() or []
-                if isinstance(data, list):
-                    return data
-            # Non-200: keep trying
-        except Exception as e:  # network / JSON
-            last_error = e
+        for _name, base in providers:
+            try:
+                r = requests.get(f"{base}/address/{address}/utxo", timeout=timeout)
+                if r.status_code == 200:
+                    data = r.json() or []
+                    if isinstance(data, list):
+                        return data
+                # Non-200: try next provider
+            except Exception as e:  # network / JSON
+                last_error = e
         # tiny backoff (no asyncio so simple sleep) only if more attempts left
         if attempt < retries:
             try:
@@ -237,27 +261,29 @@ def _fetch_address_utxos(address: str, network: str, timeout: float = 5.0, retri
     return []
 
 
-def _fetch_address_utxos_status(address: str, network: str, timeout: float = 5.0, retries: int = 2) -> Tuple[List[Dict], bool]:
-    """Variant returning (utxos, ok_flag) where ok_flag=True only if an HTTP 200 was received.
+def _fetch_address_utxos_status(address: str, network: str, timeout: float = 5.0, retries: int = 2) -> Tuple[List[Dict], bool, Optional[str]]:
+    """Variant returning (utxos, ok_flag, provider_used).
 
-    Needed so list_utxos can distinguish between 'truly empty' and network failure for diagnostics.
+    ok_flag=True only if an HTTP 200 was received by any provider.
+    provider_used is the name of the provider that returned 200, else None.
     """
-    base = _api_base(network)
+    providers = _provider_sequence(network)
     for attempt in range(retries + 1):
-        try:
-            r = requests.get(f"{base}/address/{address}/utxo", timeout=timeout)
-            if r.status_code == 200:
-                data = r.json() or []
-                return (data if isinstance(data, list) else [], True)
-        except Exception:
-            pass
+        for name, base in providers:
+            try:
+                r = requests.get(f"{base}/address/{address}/utxo", timeout=timeout)
+                if r.status_code == 200:
+                    data = r.json() or []
+                    return (data if isinstance(data, list) else [], True, name)
+            except Exception:
+                pass
         if attempt < retries:
             try:
                 import time
                 time.sleep(0.15 * (attempt + 1))
             except Exception:
                 pass
-    return ([], False)
+    return ([], False, None)
 
 
 def _enumerate_addresses(xpub: str, network: str, receive_limit: int, change_limit: int) -> List[Dict]:
@@ -388,6 +414,51 @@ def get_balance(xpub: str, network: str = "testnet") -> Dict:
     except Exception as e:
         return {"success": False, "error": str(e)}
 
+
+@tool
+def verify_utxo(txid: str, network: str = "testnet") -> Dict:
+    """Verifica si una transacció existeix i retorna els seus outputs i estat usant exploradors amb fallback.
+
+    Retorna:
+      - success: bool
+      - provider: quin proveïdor ha respost
+      - tx: informació bàsica (si disponible)
+      - vout: llista d'outputs amb valor i adreça (si proporcionat pel proveïdor)
+      - outspends: estat gastat per a cada vout si l'API ho permet
+    """
+    providers = _provider_sequence(network)
+    last_error: Optional[str] = None
+    for name, base in providers:
+        try:
+            # Nota: Blockstream: /tx/{txid}, /tx/{txid}/outspends; Mempool: /tx/{txid} i /tx/{txid}/outspends (similars)
+            r = requests.get(f"{base}/tx/{txid}", timeout=7)
+            if r.status_code != 200:
+                continue
+            tx = r.json() or {}
+            # Outputs
+            vout = tx.get("vout") or tx.get("outs") or []
+            # Outspends (gastats?)
+            outspends = None
+            try:
+                r2 = requests.get(f"{base}/tx/{txid}/outspends", timeout=7)
+                if r2.status_code == 200:
+                    outspends = r2.json()
+            except Exception:
+                pass
+            return {
+                "success": True,
+                "provider": name,
+                "txid": txid,
+                "tx": tx,
+                "vout": vout,
+                "outspends": outspends,
+                "network": network,
+            }
+        except Exception as e:
+            last_error = str(e)
+            continue
+    return {"success": False, "error": last_error or "No provider returned tx info", "txid": txid, "network": network}
+
 @tool
 def generate_address(xpub: str, network: str = "testnet", index: int = 0, require_unused: bool = True, max_scan: int = 200) -> Dict:
     """
@@ -447,16 +518,34 @@ def list_utxos(xpub: str, network: str = "testnet") -> Dict:
     Llista totes les UTXOs (Unspent Transaction Outputs) disponibles.
     """
     try:
-        scan_receive = 10
-        scan_change = 5
+        # Allow environment overrides for scan limits to accommodate wallets with larger gaps
+        try:
+            scan_receive = int(os.getenv("BITCOIN_SCAN_RECEIVE", "10"))
+        except Exception:
+            scan_receive = 10
+        try:
+            scan_change = int(os.getenv("BITCOIN_SCAN_CHANGE", "5"))
+        except Exception:
+            scan_change = 5
         address_entries = _enumerate_addresses(xpub, network, scan_receive, scan_change)
 
         all_utxos: List[Dict] = []
         network_errors = 0
+        providers_used: List[str] = []
         for entry in address_entries:
-            utxos_raw, ok = _fetch_address_utxos_status(entry["address"], network)
+            _ret = _fetch_address_utxos_status(entry["address"], network)
+            # Back-compat: allow tests to monkeypatch a 2-tuple (utxos, ok)
+            if isinstance(_ret, tuple) and len(_ret) == 3:
+                utxos_raw, ok, prov = _ret
+            elif isinstance(_ret, tuple) and len(_ret) == 2:
+                utxos_raw, ok = _ret
+                prov = None
+            else:
+                utxos_raw, ok, prov = [], False, None
             if not ok:
                 network_errors += 1
+            if ok and prov:
+                providers_used.append(prov)
             for utxo in utxos_raw:
                 all_utxos.append({
                     "txid": utxo.get("txid", ""),
@@ -470,6 +559,40 @@ def list_utxos(xpub: str, network: str = "testnet") -> Dict:
                     "confirmations": utxo.get("status", {}).get("confirmations", 0),
                 })
 
+        # If we found nothing and the network appeared healthy, attempt an extended scan once
+        attempted_extended = False
+        if not all_utxos and network_errors == 0:
+            attempted_extended = True
+            ext_receive = max(scan_receive, 50)
+            ext_change = max(scan_change, 20)
+            # Enumerate only the additional range beyond the original
+            extra_addrs = _enumerate_addresses(xpub, network, ext_receive, ext_change)[len(address_entries):]
+            for entry in extra_addrs:
+                _ret = _fetch_address_utxos_status(entry["address"], network)
+                if isinstance(_ret, tuple) and len(_ret) == 3:
+                    utxos_raw, ok, prov = _ret
+                elif isinstance(_ret, tuple) and len(_ret) == 2:
+                    utxos_raw, ok = _ret
+                    prov = None
+                else:
+                    utxos_raw, ok, prov = [], False, None
+                if not ok:
+                    network_errors += 1  # count failures even in extended scan
+                if ok and prov:
+                    providers_used.append(prov)
+                for utxo in utxos_raw:
+                    all_utxos.append({
+                        "txid": utxo.get("txid", ""),
+                        "vout": utxo.get("vout", 0),
+                        "value_satoshis": utxo.get("value", 0),
+                        "value_btc": utxo.get("value", 0) / 100_000_000,
+                        "address": entry["address"],
+                        "path": entry["path"],
+                        "index": entry["index"],
+                        "change": entry["change"],
+                        "confirmations": utxo.get("status", {}).get("confirmations", 0),
+                    })
+
         total_value_sat = sum(u["value_satoshis"] for u in all_utxos)
         result = {
             "success": True,
@@ -480,10 +603,18 @@ def list_utxos(xpub: str, network: str = "testnet") -> Dict:
             "receive_addresses_checked": scan_receive,
             "change_addresses_checked": scan_change,
             "network": network,
+            "provider_primary": _provider_sequence(network)[0][0],
+            "provider_any_used": list(sorted(set(providers_used))) if providers_used else [],
         }
         if len(all_utxos) == 0 and network_errors == len(address_entries):
             result["note"] = "Cap UTXO retornada i totes les consultes han fallat (possible problema de xarxa o rate-limit)."
             result["network_errors"] = network_errors
+        elif len(all_utxos) == 0 and attempted_extended and network_errors == 0:
+            # Extended scan attempted but still no UTXOs; inform user about possible gap limit issues
+            result["note"] = (
+                "Cap UTXO trobada després d'un escaneig ampliat (possible gap superior al llindar). "
+                "Pots ajustar els límits amb BITCOIN_SCAN_RECEIVE i BITCOIN_SCAN_CHANGE."
+            )
         return result
     except Exception as e:
         return {"success": False, "error": str(e)}
@@ -578,9 +709,16 @@ def create_transaction(
         
         utxos = utxos_result["utxos"]
         if not utxos:
+            # Propagate diagnostic notes if present (network failure or gap limit)
+            msg = "No hi ha UTXOs disponibles"
+            note = utxos_result.get("note")
+            if note:
+                msg += f". Nota: {note}"
+            # Provide hint for increasing scan range via environment if user suspects address gap
+            msg += " (Pots provar d'incrementar BITCOIN_SCAN_RECEIVE i BITCOIN_SCAN_CHANGE si tens un gap gran)"
             return {
                 "success": False,
-                "error": "No hi ha UTXOs disponibles"
+                "error": msg,
             }
         
         # Si tenim el creador de PSBT, usar-lo
@@ -597,6 +735,8 @@ def create_transaction(
             change_address=change_address,
             network=network,
             fee_rate=fee_rate,
+            # Max privacy by default unless explicitly overridden via env
+            privacy_preset=DEFAULT_PRIVACY_PRESET,
         )
         
         if result["success"]:
@@ -724,6 +864,58 @@ def create_transaction_manual(
         change_info = derive_address_and_path(xpub, network, index=change_index, change=True)
         change_address = change_info["address"]
 
+        # ---------------- Autonomous privacy policy (manual coin control) ----------------
+        # Heuristics:
+        #  - Shuffle inputs/outputs deterministically (seed derived from txids, recipient, fee_rate)
+        #  - Omit GLOBAL_XPUB and keypaths to reduce metadata leak
+        #  - RBF enabled by default (safer fee-bumping and anti-stuck)
+        #  - Prefer WITNESS_UTXO for legacy P2PKH inputs to avoid fetching full prev-tx
+        #  - Avoid tiny change: fold into fee if leftover < threshold
+        def _decide_privacy_flags_manual(
+            selected_utxos: List[Dict],
+            recipient: str,
+            amt_btc: float,
+            frate: int,
+            net: str,
+        ) -> Dict[str, object]:
+            # Deterministic shuffle seed
+            ids = ",".join(sorted(f"{u.get('txid')}:{u.get('vout')}" for u in selected_utxos))
+            seed_material = f"manual|{ids}|{recipient}|{amt_btc:.8f}|{frate}|{net}".encode()
+            seed = int.from_bytes(hashlib.sha256(seed_material).digest()[:8], "big") & 0x7FFFFFFF
+
+            # Legacy detection (P2PKH) among selected inputs
+            has_legacy = False
+            for u in selected_utxos:
+                addr = (u.get("address") or "").strip()
+                if addr:
+                    t = detect_address_type(addr)
+                    if t == "p2pkh":
+                        has_legacy = True
+                        break
+
+            # Conservative threshold for folding small change into fee
+            # Use the larger of 5_000 sats or ~2 output vbytes at current feerate
+            min_change_sats = max(5000, int(frate * 2 * 31))
+
+            # Enable shuffle when it can change ordering; seed ensures determinism across retries
+            shuffle_inputs = len(selected_utxos) > 1
+            # We might end with 1 or 2 outputs; still shuffle deterministically (no-op on 1)
+            shuffle_outputs = True
+
+            return {
+                "shuffle_inputs": shuffle_inputs,
+                "shuffle_outputs": shuffle_outputs,
+                "shuffle_seed": seed,
+                "include_global_xpub": False,
+                "include_keypaths": False,
+                "rbf": True,
+                "prefer_legacy_witness_utxo": has_legacy,
+                "avoid_change": True,
+                "min_change_sats": min_change_sats,
+            }
+
+        flags = _decide_privacy_flags_manual(selected, recipient_address, amount_btc, fee_rate, network)
+
         build = create_transaction_psbt(
             xpub=xpub,
             recipient_address=recipient_address,
@@ -733,6 +925,16 @@ def create_transaction_manual(
             network=network,
             fee_rate=fee_rate,
             manual_selected_utxos=selected,
+            # Explicit flags chosen by agent policy (do not pass privacy_preset here)
+            shuffle_inputs=bool(flags.get("shuffle_inputs", False)),
+            shuffle_outputs=bool(flags.get("shuffle_outputs", False)),
+            avoid_change=bool(flags.get("avoid_change", False)),
+            min_change_sats=int(flags.get("min_change_sats", 5000)),
+            include_global_xpub=bool(flags.get("include_global_xpub", False)),
+            include_keypaths=bool(flags.get("include_keypaths", False)),
+            rbf=bool(flags.get("rbf", True)),
+            prefer_legacy_witness_utxo=bool(flags.get("prefer_legacy_witness_utxo", False)),
+            shuffle_seed=int(flags.get("shuffle_seed", 0)),
         )
         if build.get("success"):
             build["selection_mode"] = "manual"
@@ -740,6 +942,43 @@ def create_transaction_manual(
             build["used_utxos"] = [f"{u.get('txid')}:{u.get('vout')}" for u in selected]
             if missing:
                 build["missing"] = list(missing)
+            # Attach explicit privacy flags and a short report so the agent can disclose them
+            privacy_flags = {
+                "shuffle_inputs": bool(flags.get("shuffle_inputs", False)),
+                "shuffle_outputs": bool(flags.get("shuffle_outputs", False)),
+                "shuffle_seed": int(flags.get("shuffle_seed", 0)),
+                "rbf": bool(flags.get("rbf", True)),
+                "include_global_xpub": bool(flags.get("include_global_xpub", False)),
+                "include_keypaths": bool(flags.get("include_keypaths", False)),
+                "prefer_legacy_witness_utxo": bool(flags.get("prefer_legacy_witness_utxo", False)),
+                "avoid_change": bool(flags.get("avoid_change", False)),
+                "min_change_sats": int(flags.get("min_change_sats", 5000)),
+            }
+            lines = []
+            if privacy_flags["shuffle_inputs"] or privacy_flags["shuffle_outputs"]:
+                which = []
+                if privacy_flags["shuffle_inputs"]:
+                    which.append("inputs")
+                if privacy_flags["shuffle_outputs"]:
+                    which.append("outputs")
+                lines.append(f"Shuffled {', '.join(which)} deterministically (seed={privacy_flags['shuffle_seed']}).")
+            else:
+                lines.append("No shuffling applied (single input/output makes it a no-op).")
+            if privacy_flags["rbf"]:
+                lines.append("RBF enabled (non-final sequences) for fee bumping and anti-stuck.")
+            if not privacy_flags["include_global_xpub"]:
+                lines.append("Omitted GLOBAL_XPUB (reduce wallet fingerprint leakage).")
+            if not privacy_flags["include_keypaths"]:
+                lines.append("Omitted BIP32 keypaths (minimize derivation metadata).")
+            if privacy_flags["prefer_legacy_witness_utxo"]:
+                lines.append("Preferred WITNESS_UTXO for legacy inputs to avoid fetching full prev-tx.")
+            if privacy_flags["avoid_change"]:
+                lines.append(
+                    f"Avoided small change: threshold={privacy_flags['min_change_sats']} sats (folded into fee if below)."
+                )
+            build["privacy_flags"] = privacy_flags
+            build["privacy_report"] = lines
+            build["privacy_summary"] = " ".join(lines)
         return build
     except Exception as e:
         return {"success": False, "error": str(e)}
@@ -772,7 +1011,8 @@ class BitcoinAIAgent:
             get_fee_rates,
             create_transaction,
             create_transaction_manual,
-            decode_psbt  # Nova eina
+            decode_psbt,  # Nova eina
+            verify_utxo,
         ]
         
         self.llm = ChatOpenAI(

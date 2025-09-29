@@ -12,6 +12,7 @@ from typing import List, Dict, Optional, Tuple
 from decimal import Decimal
 import requests
 import math
+import random
 
 # Derivation helper
 try:
@@ -377,6 +378,11 @@ class PSBTCreator:
         return_dict: bool = True,
         include_derivations: bool = True,
         proprietary: Optional[List[Tuple[bytes, int, bytes, bytes]]] = None,
+        # Privacy knobs (defaults chosen to preserve historical behavior)
+        include_global_xpub: bool = True,
+        rbf: bool = False,
+        # If True, do not attempt to fetch prev_tx for legacy inputs; always include witness_utxo
+        prefer_legacy_witness_utxo: bool = False,
     ) -> Dict:
         """
         Construeix una PSBT v0 amb la transacció unsigned i mapes d'inputs/outputs mínims.
@@ -384,11 +390,15 @@ class PSBTCreator:
         Nou comportament: retorna un diccionari estructurat amb camps clau.
         Compatibilitat: si es vol el string Base64 directament, accedir a ['psbt']
         o utilitzar el helper `create_psbt_base64` (veure més avall).
+
+                Paràmetres de privadesa (opcionales):
+                    - include_global_xpub: si False, omet l'entrada GLOBAL_XPUB (evita filtrar informació d'arrel).
+                    - rbf: si True, estableix sequence < 0xffffffff per permetre RBF.
+                    - prefer_legacy_witness_utxo: per inputs legacy, evita demanar la transacció anterior i inclou WITNESS_UTXO.
         """
         # 1) Transacció unsigned (sense witnesses)
         tx_bytes = b""
         tx_bytes += struct.pack("<I", version)
-
 
         tx_bytes += self._compact_size(len(inputs))
 
@@ -397,7 +407,8 @@ class PSBTCreator:
             tx_bytes += txid_bytes
             tx_bytes += struct.pack("<I", int(inp["vout"]))
             tx_bytes += b"\x00"  # scriptsig buit
-            tx_bytes += b"\xff\xff\xff\xff"  # sequence
+            # Sequence: enable RBF when requested by clearing the finality bit (less than 0xFFFFFFFF)
+            tx_bytes += (b"\xfd\xff\xff\xff" if rbf else b"\xff\xff\xff\xff")
 
         tx_bytes += self._compact_size(len(outputs))
         for output in outputs:
@@ -542,7 +553,7 @@ class PSBTCreator:
         global_map = b""
         global_map += self._write_key_value(PSBT_GLOBAL_UNSIGNED_TX, b"", tx_bytes)
         global_map += self._write_key_value(PSBT_GLOBAL_VERSION, b"", struct.pack("<I", 0))  # PSBT v0
-        if serialized_xpub and root_fp and xpub_depth is not None and xpub_childnum is not None and xpub_version_int is not None:
+        if include_global_xpub and serialized_xpub and root_fp and xpub_depth is not None and xpub_childnum is not None and xpub_version_int is not None:
             path_indices = _guess_xpub_path(xpub_depth, xpub_childnum, xpub_version_int, self.network)
             if path_indices is not None and len(path_indices) == xpub_depth:
                 value = root_fp + b"".join(struct.pack("<I", i) for i in path_indices)
@@ -565,7 +576,7 @@ class PSBTCreator:
             input_map = b""
             address_str = inp.get("address", "")
             version_or_prefix, addr_hash = self._decode_address(address_str)
-            prev_tx = self._fetch_transaction(inp["txid"])
+            prev_tx = None if prefer_legacy_witness_utxo else self._fetch_transaction(inp["txid"])
 
             # Build scriptPubKey from address
             script: bytes
@@ -825,12 +836,46 @@ def create_transaction_psbt(
     fee_rate: int = 10,
     fee_satoshis: Optional[int] = None,
     manual_selected_utxos: Optional[List[Dict]] = None,
+    # Privacy options (defaults keep prior behavior)
+    shuffle_inputs: bool = False,
+    shuffle_outputs: bool = False,
+    avoid_change: bool = False,
+    min_change_sats: Optional[int] = None,
+    include_global_xpub: bool = True,
+    include_keypaths: bool = True,
+    rbf: bool = False,
+    prefer_legacy_witness_utxo: bool = False,
+    locktime_override: Optional[int] = None,
+    shuffle_seed: Optional[int] = None,
+    privacy_preset: Optional[str] = None,
 ) -> Dict:
     """
     Crea un PSBT per una transacció:
       - Si 'fee_satoshis' és None, calcula la comissió a partir de 'fee_rate' (sat/vB) segons vbytes reals.
       - Si 'fee_satoshis' ve informat, es respecta (mode compatibilitat).
+
+    Paràmetres de privadesa (opcionales):
+      - shuffle_inputs/outputs: barreja ordre d'inputs i/o outputs per trencar heurístiques.
+      - avoid_change: si True, quan el canvi és petit (<= min_change_sats o dust), s'afegeix a la fee per evitar output de canvi.
+      - min_change_sats: llindar custom per a suppressió de canvi (per defecte = DUST_THRESHOLD quan s'usa avoid_change).
+      - include_global_xpub/include_keypaths: controla la presència de GLOBAL_XPUB i BIP32 derivations.
+      - rbf: activa Replace-By-Fee establint sequence < 0xffffffff.
+      - prefer_legacy_witness_utxo: no demana transaccions anteriors per inputs legacy; sempre usa WITNESS_UTXO.
+      - locktime_override: locktime explícit (anti fee-sniping manual), 0 si no es proveeix.
+      - shuffle_seed: llavor per aleatorietat determinista.
+      - privacy_preset: "max" aplica un conjunt d'opcions conservadores de màxima privadesa.
     """
+    # Apply privacy preset if requested (opt-in; conservative defaults otherwise)
+    if privacy_preset and privacy_preset.lower() in ("max", "maximum", "paranoid"):
+        shuffle_inputs = True
+        shuffle_outputs = True
+        avoid_change = True
+        min_change_sats = 5000 if min_change_sats is None else min_change_sats
+        include_global_xpub = False
+        include_keypaths = False
+        rbf = True
+        prefer_legacy_witness_utxo = True
+
     creator = PSBTCreator(network)
 
     # amount a sats
@@ -899,6 +944,12 @@ def create_transaction_psbt(
             change_satoshis = total_input - amount_satoshis - int(fee_satoshis)
 
     # Outputs
+    # Optional change suppression to avoid linking smaller change to sender
+    eff_threshold = DUST_THRESHOLD if min_change_sats is None else int(min_change_sats)
+    if avoid_change and change_satoshis > 0 and change_satoshis <= eff_threshold:
+        fee_satoshis = int(fee_satoshis) + int(change_satoshis)
+        change_satoshis = 0
+
     outputs = [{"address": recipient_address, "value": amount_satoshis}]
     if change_satoshis > DUST_THRESHOLD:
         if not change_address:
@@ -908,9 +959,25 @@ def create_transaction_psbt(
             }
         outputs.append({"address": change_address, "value": int(change_satoshis)})
 
+    # Shuffle input/output order to defeat heuristics (opt-in)
+    rng = random.Random(shuffle_seed)
+    if shuffle_inputs:
+        rng.shuffle(selected_utxos)
+    if shuffle_outputs:
+        rng.shuffle(outputs)
+
     # Crear PSBT
     try:
-        psbt_build = creator.create_psbt(inputs=selected_utxos, outputs=outputs, xpub=xpub)
+        psbt_build = creator.create_psbt(
+            inputs=selected_utxos,
+            outputs=outputs,
+            xpub=xpub,
+            locktime=locktime_override or 0,
+            include_derivations=bool(include_keypaths),
+            include_global_xpub=bool(include_global_xpub),
+            rbf=bool(rbf),
+            prefer_legacy_witness_utxo=bool(prefer_legacy_witness_utxo),
+        )
 
         psbt_base64 = psbt_build["psbt"]
         return {

@@ -1,0 +1,71 @@
+# In bitcoin_ai_agent.py
+
+class BitcoinAIAgent:
+    def __init__(self, xpub: str, network: str):
+        self.xpub = xpub
+        self.network = network
+
+    async def create_psbt(self, inputs: List[Dict], outputs: List[Dict], shuffle_seed: Optional[int] = None, rbf: bool = False) -> Dict:
+        """
+        Create a PSBT with the specified inputs and outputs.
+        Supports deterministic shuffling of inputs and outputs if a shuffle seed is provided.
+        Enables RBF if specified.
+        """
+        # Shuffle inputs and outputs if a seed is provided
+        if shuffle_seed is not None:
+            random.seed(shuffle_seed)
+            random.shuffle(inputs)
+            random.shuffle(outputs)
+
+        # Prepare the PSBT creation parameters
+        psbt_params = {
+            "inputs": inputs,
+            "outputs": outputs,
+            "rbf": rbf,
+            "include_global_xpub": False,  # Omit GLOBAL_XPUB
+            "include_keypaths": False,  # Omit BIP32 keypaths
+            "prefer_legacy_witness_utxo": True,  # Prefer WITNESS_UTXO for legacy inputs
+        }
+
+        # Create the PSBT
+        psbt = create_transaction_psbt(self.xpub, psbt_params)
+        
+        # Handle small change by folding it into the fee
+        self._handle_small_change(psbt)
+
+        return psbt
+
+    def _handle_small_change(self, psbt: Dict):
+        """
+        Adjust the PSBT to avoid small change by folding it into the fee.
+        """
+        total_output = sum(output['amount'] for output in psbt['outputs'])
+        total_input = sum(input['amount'] for input in psbt['inputs'])
+
+        # Calculate the change amount
+        change_amount = total_input - total_output
+
+        # Define a dust threshold (in satoshis)
+        DUST_THRESHOLD = 546
+
+        if change_amount > 0 and change_amount < DUST_THRESHOLD:
+            # If change is below the dust threshold, add it to the fee
+            psbt['fee'] += change_amount
+            psbt['change'] = 0  # Set change to zero
+
+        return psbt
+
+# Example usage
+async def main():
+    agent = BitcoinAIAgent(xpub=DEFAULT_XPUB, network=DEFAULT_NETWORK)
+    inputs = [...]  # Define your inputs
+    outputs = [...]  # Define your outputs
+    shuffle_seed = 12345  # Example seed for shuffling
+    rbf = True  # Enable RBF
+
+    psbt = await agent.create_psbt(inputs, outputs, shuffle_seed=shuffle_seed, rbf=rbf)
+    print(psbt)
+
+if __name__ == "__main__":
+    import asyncio
+    asyncio.run(main())

@@ -52,7 +52,7 @@ def test_agent():
     
     # Tests
     test_queries = [
-        "fesme una psbt que em dongui la major quantitat de privacitat possible a tb1q8dfs3646l8d3yq7yvxq6e4vjn9d8p6jfnn57ph d 299 mil sats"
+        "fesme una psbt que em dongui la major quantitat de privacitat diguem que has fet perque sigui lo mes privada possible a tb1q8dfs3646l8d3yq7yvxq6e4vjn9d8p6jfnn57ph d 299 mil sats"
     ]
     
     print("\n🧪 Executant tests...")
