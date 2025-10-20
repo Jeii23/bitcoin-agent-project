@@ -376,12 +376,10 @@ class PSBTCreator:
         version: int = 2,
         xpub: Optional[str] = None,
         return_dict: bool = True,
-        include_derivations: bool = True,
+        include_derivations: bool = False,
         proprietary: Optional[List[Tuple[bytes, int, bytes, bytes]]] = None,
-        # Privacy knobs (defaults chosen to preserve historical behavior)
-        include_global_xpub: bool = True,
+        include_global_xpub: bool = False,
         rbf: bool = False,
-        # If True, do not attempt to fetch prev_tx for legacy inputs; always include witness_utxo
         prefer_legacy_witness_utxo: bool = False,
     ) -> Dict:
         """

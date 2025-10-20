@@ -39,6 +39,27 @@ def _purpose_and_method(xpub_like: str):
 _b58decode_check = codec.b58decode_check  # Shim for existing internal usage
 _b58encode_check = codec.b58encode_check
 
+
+def _sanitize_extended_key(x: str) -> str:
+    """Normalize an extended public key string to avoid Base58 decode errors.
+
+    - Strips surrounding whitespace and common quotes/brackets.
+    - Removes zero-width and NBSP characters often introduced by UI copy/paste.
+    - Collapses internal whitespace.
+    """
+    if not isinstance(x, str):
+        return x
+    s = x.strip().strip("’‘'\"“”<>[](){}.,:;`“”")
+    for ch in ("\u200b", "\ufeff", "\u2060", "\u00A0"):
+        s = s.replace(ch, "")
+    # Remove any remaining whitespace sequences
+    try:
+        import re
+        s = re.sub(r"\s+", "", s)
+    except Exception:
+        pass
+    return s
+
 # ---------- mapes de versions SLIP-0132 ----------
 _VERSION_MAP_TO_XPUB = {
     0x049D7CB2: 0x0488B21E,  # ypub → xpub
@@ -50,6 +71,7 @@ _VERSION_MAP_TO_TPUB = {
 }
 
 def _normalize_to_x_or_t_pub(xpub_like: str) -> str:
+    xpub_like = _sanitize_extended_key(xpub_like)
     raw = _b58decode_check(xpub_like)
     if len(raw) != 78:
         raise ValueError(f"Extended key longitud incorrecta: {len(raw)} bytes (78 esperats)")
@@ -64,6 +86,7 @@ def _normalize_to_x_or_t_pub(xpub_like: str) -> str:
     return xpub_like
 
 def _version_implies_testnet(xpub_like: str) -> bool:
+    xpub_like = _sanitize_extended_key(xpub_like)
     raw = _b58decode_check(xpub_like)
     if len(raw) != 78:
         return False
@@ -97,6 +120,9 @@ def derive_bitcoin_address(xpub_or_zpub: str, index: int = 0, change: bool = Fal
     try:
         if index < 0 or index >= 2**31:
             raise ValueError("Index fora de rang no-hardened")
+
+        # Sanitize key early to avoid base58 checksum spam from hidden characters
+        xpub_or_zpub = _sanitize_extended_key(xpub_or_zpub)
 
         # Xarxa deduïda (version bytes)
         net = "testnet" if _version_implies_testnet(xpub_or_zpub) else network
@@ -157,7 +183,9 @@ def derive_bitcoin_address(xpub_or_zpub: str, index: int = 0, change: bool = Fal
             "network": net,
         }
     except Exception as e:
-        traceback.print_exc()
+        # Avoid noisy stack traces by default; callers surface concise error messages.
+        # Uncomment for debugging:
+        # traceback.print_exc()
         return {"success": False, "error": str(e)}
 
 # ---------- test ----------

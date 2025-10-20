@@ -42,11 +42,12 @@ except ImportError:
 
 # Derivació d'adreces pròpia
 try:
-    from address_derivation import derive_bitcoin_address
+    from address_derivation import derive_bitcoin_address, _normalize_to_x_or_t_pub
     CUSTOM_DERIVATION_AVAILABLE = True
     print("[INFO] Derivació personalitzada disponible (derive_bitcoin_address)")
 except ImportError:
     CUSTOM_DERIVATION_AVAILABLE = False
+    _normalize_to_x_or_t_pub = None
     print("[WARNING] No s'ha trobat address_derivation.py")
 
 # IMPORTAR EL NOU CREADOR DE PSBT
@@ -179,20 +180,23 @@ def _count_psbt_blobs(text: str) -> int:
 
 
 def _provider_sequence(network: str):
-        """Return ordered list of (provider_name, base_url) based on BLOCKCHAIN_API env.
+    """Return ordered list of (provider_name, base) based on BLOCKCHAIN_API env.
 
-        BLOCKCHAIN_API values:
-            - "blockstream": prefer Blockstream, fallback to Mempool
-            - "mempool": prefer Mempool, fallback to Blockstream
-            - other/"auto": same as blockstream preference
-        """
-        pref = os.getenv("BLOCKCHAIN_API", "auto").lower()
-        bs = ("blockstream", "https://blockstream.info/testnet/api" if network == "testnet" else "https://blockstream.info/api")
-        mp = ("mempool", "https://mempool.space/testnet/api" if network == "testnet" else "https://mempool.space/api")
-        if pref == "mempool":
-                return [mp, bs]
-        # default and "blockstream"
-        return [bs, mp]
+    Supported values:
+      - "core" | "bitcoin-core" | "rpc": Bitcoin Core JSON-RPC
+      - "blockstream": Blockstream REST (fallback mempool.space)
+      - "mempool": Mempool.space REST (fallback Blockstream)
+      - other/"auto": default to Blockstream then Mempool
+    """
+    pref = os.getenv("BLOCKCHAIN_API", "auto").lower()
+    bs = ("blockstream", "https://blockstream.info/testnet/api" if network == "testnet" else "https://blockstream.info/api")
+    mp = ("mempool", "https://mempool.space/testnet/api" if network == "testnet" else "https://mempool.space/api")
+    if pref in ("core", "bitcoin-core", "rpc"):
+        return [("core", "rpc")]
+    if pref == "mempool":
+        return [mp, bs]
+    # default and "blockstream"
+    return [bs, mp]
 
 
 def _address_has_history(address: str, network: str) -> bool:
@@ -206,6 +210,14 @@ def _address_has_history(address: str, network: str) -> bool:
          restores prior UX where first unused appeared earlier instead of jumping ahead.
     """
     providers = _provider_sequence(network)
+    # Bitcoin Core path (uses scantxoutset; detects only current UTXOs)
+    if providers and providers[0][0] == "core":
+        try:
+            utxos = _core_scantxoutset([address])
+            return len(utxos) > 0
+        except Exception:
+            return False
+    # REST providers
     for _name, base in providers:
         try:
             r = requests.get(f"{base}/address/{address}", timeout=6)
@@ -237,8 +249,20 @@ def _fetch_address_utxos(address: str, network: str, timeout: float = 5.0, retri
 
     Returns empty list if all attempts fail (never raises) to keep deterministic higher-level code.
     """
-    last_error: Optional[Exception] = None
     providers = _provider_sequence(network)
+    # Bitcoin Core path
+    if providers and providers[0][0] == "core":
+        try:
+            core_utxos = _core_scantxoutset([address])
+            # Normalize to REST-like schema for callers
+            for u in core_utxos:
+                if "value" not in u and "amount" in u:
+                    u["value"] = int(round(float(u.get("amount", 0.0)) * 100_000_000))
+            return core_utxos
+        except Exception:
+            return []
+    # REST providers
+    last_error: Optional[Exception] = None
     for attempt in range(retries + 1):
         for _name, base in providers:
             try:
@@ -250,7 +274,7 @@ def _fetch_address_utxos(address: str, network: str, timeout: float = 5.0, retri
                 # Non-200: try next provider
             except Exception as e:  # network / JSON
                 last_error = e
-        # tiny backoff (no asyncio so simple sleep) only if more attempts left
+        # tiny backoff
         if attempt < retries:
             try:
                 import time
@@ -268,6 +292,17 @@ def _fetch_address_utxos_status(address: str, network: str, timeout: float = 5.0
     provider_used is the name of the provider that returned 200, else None.
     """
     providers = _provider_sequence(network)
+    # Bitcoin Core path
+    if providers and providers[0][0] == "core":
+        try:
+            core_utxos = _core_scantxoutset([address])
+            for u in core_utxos:
+                if "value" not in u and "amount" in u:
+                    u["value"] = int(round(float(u.get("amount", 0.0)) * 100_000_000))
+            return (core_utxos, True, "core")
+        except Exception:
+            return ([], False, "core")
+    # REST providers
     for attempt in range(retries + 1):
         for name, base in providers:
             try:
@@ -284,6 +319,46 @@ def _fetch_address_utxos_status(address: str, network: str, timeout: float = 5.0
             except Exception:
                 pass
     return ([], False, None)
+
+
+# ================= Bitcoin Core RPC helpers =================
+def _core_rpc_endpoint() -> str:
+    """Build the Core RPC URL from env or defaults provided by the user."""
+    user = os.getenv("BITCOIN_RPC_USER")
+    pwd = os.getenv("BITCOIN_RPC_PASSWORD")
+    host = os.getenv("BITCOIN_RPC_HOST")
+    port = os.getenv("BITCOIN_RPC_PORT")
+    return f"http://{user}:{pwd}@{host}:{port}"
+
+
+def _core_rpc_call(method: str, params: List) -> Dict:
+    headers = {"content-type": "application/json"}
+    payload = {"jsonrpc": "1.0", "id": "agent", "method": method, "params": params}
+    url = _core_rpc_endpoint()
+    r = requests.post(url, json=payload, headers=headers, timeout=10)
+    r.raise_for_status()
+    j = r.json()
+    if j.get("error"):
+        raise RuntimeError(f"RPC {method} error: {j['error']}")
+    return j.get("result")
+
+
+def _core_scantxoutset(addresses: List[str]) -> List[Dict]:
+    """Query Core via scantxoutset for UTXOs belonging to addresses (no wallet import required)."""
+    scanobjects = [f"addr({a})" for a in addresses]
+    res = _core_rpc_call("scantxoutset", ["start", scanobjects]) or {}
+    utxos: List[Dict] = []
+    for u in (res.get("unspents") or []):
+        # Map to REST-like fields
+        amount_btc = float(u.get("amount", 0.0))
+        utxos.append({
+            "txid": u.get("txid"),
+            "vout": u.get("vout"),
+            "value": int(round(amount_btc * 100_000_000)),
+            "address": (u.get("desc", "").split("(")[-1].rstrip(")")) or None,
+            "height": u.get("height"),
+        })
+    return utxos
 
 
 def _enumerate_addresses(xpub: str, network: str, receive_limit: int, change_limit: int) -> List[Dict]:
@@ -332,22 +407,19 @@ def derive_address_and_path(xpub: str, network: str, index: int, change: bool = 
             if res.get("success"):
                 return {"address": res["address"], "path": res.get("path", "")}
             else:
-                print(f"[WARN] Derivació personalitzada ha fallat: {res.get('error')}")
+                if os.getenv("BITCOIN_AGENT_VERBOSE", "0") == "1":
+                    print(f"[WARN] Derivació personalitzada ha fallat: {res.get('error')}")
                 last_error = res.get("error") or last_error
         except Exception as e:
-            print(f"[ERROR] Derivació personalitzada: {e}")
+            if os.getenv("BITCOIN_AGENT_VERBOSE", "0") == "1":
+                print(f"[ERROR] Derivació personalitzada: {e}")
             last_error = str(e)
 
     # 2) Fallback: HDWallet simple
-    # 2) Fallback: HDWallet simple
     if HDWALLET_AVAILABLE:
         try:
-            # ✨ NORMALITZA SLIP-132 (vpub/upub → tpub ; zpub/ypub → xpub)
-            try:
-                from address_derivation import _normalize_to_x_or_t_pub as _norm
-                normalized = _norm(xpub)
-            except Exception:
-                normalized = xpub  # si no hi ha helper, prova igual
+            # Normalize SLIP-132 extended keys (vpub/upub → tpub ; zpub/ypub → xpub)
+            normalized = _normalize_to_x_or_t_pub(xpub) if _normalize_to_x_or_t_pub else xpub
 
             hdwallet = HDWallet(cryptocurrency=Bitcoin)
             hdwallet.from_xpublic_key(xpublic_key=normalized, strict=False)
@@ -359,7 +431,8 @@ def derive_address_and_path(xpub: str, network: str, index: int, change: bool = 
             path = f"m/84'/{coin_type}/0'/{chain}/{index}"
             return {"address": address, "path": path}
         except Exception as e:
-            print(f"[ERROR] Fallback HDWallet: {e}")
+            if os.getenv("BITCOIN_AGENT_VERBOSE", "0") == "1":
+                print(f"[ERROR] Fallback HDWallet: {e}")
             last_error = str(e)
     # 3) Ja no generem adreces sintètiques: llança error clar
     raise ValueError(f"Address derivation failed (no synthetic fallback). Last error: {last_error or 'unknown'}")
@@ -655,7 +728,18 @@ def create_transaction(
     recipient_address: str,
     amount_btc: float,
     fee_rate: int = 10,
-    network: str = "testnet"
+    network: str = "testnet",
+    rbf: Optional[bool] = None,
+    locktime_override: Optional[int] = None,
+    privacy_preset: Optional[str] = None,
+    shuffle_inputs: Optional[bool] = None,
+    shuffle_outputs: Optional[bool] = None,
+    avoid_change: Optional[bool] = None,
+    min_change_sats: Optional[int] = None,
+    include_global_xpub: Optional[bool] = None,
+    include_keypaths: Optional[bool] = None,
+    prefer_legacy_witness_utxo: Optional[bool] = None,
+    shuffle_seed: Optional[int] = None,
 ) -> Dict:
     """
     Crea una transacció Bitcoin (PSBT estàndard BIP-174).
@@ -735,8 +819,17 @@ def create_transaction(
             change_address=change_address,
             network=network,
             fee_rate=fee_rate,
-            # Max privacy by default unless explicitly overridden via env
-            privacy_preset=DEFAULT_PRIVACY_PRESET,
+            privacy_preset=privacy_preset if privacy_preset is not None else DEFAULT_PRIVACY_PRESET,
+            rbf=rbf if rbf is not None else False,
+            locktime_override=locktime_override,
+            shuffle_inputs=shuffle_inputs if shuffle_inputs is not None else False,
+            shuffle_outputs=shuffle_outputs if shuffle_outputs is not None else False,
+            avoid_change=avoid_change if avoid_change is not None else False,
+            min_change_sats=min_change_sats,
+            include_global_xpub=include_global_xpub if include_global_xpub is not None else True,
+            include_keypaths=include_keypaths if include_keypaths is not None else True,
+            prefer_legacy_witness_utxo=prefer_legacy_witness_utxo if prefer_legacy_witness_utxo is not None else False,
+            shuffle_seed=shuffle_seed,
         )
         
         if result["success"]:
@@ -809,6 +902,17 @@ def create_transaction_manual(
     fee_rate: int = 10,
     network: str = "testnet",
     change_index: int = 0,
+    rbf: Optional[bool] = None,
+    locktime_override: Optional[int] = None,
+    privacy_preset: Optional[str] = None,
+    shuffle_inputs: Optional[bool] = None,
+    shuffle_outputs: Optional[bool] = None,
+    avoid_change: Optional[bool] = None,
+    min_change_sats: Optional[int] = None,
+    include_global_xpub: Optional[bool] = None,
+    include_keypaths: Optional[bool] = None,
+    prefer_legacy_witness_utxo: Optional[bool] = None,
+    shuffle_seed: Optional[int] = None,
 ) -> Dict:
     """Crea una PSBT triant manualment UTXOs (format utxo_ids: "<txid>:<vout>").
 
@@ -853,6 +957,17 @@ def create_transaction_manual(
                 change_address=derive_address_and_path(xpub, network, index=change_index, change=True)["address"],
                 network=network,
                 fee_rate=fee_rate,
+                privacy_preset=privacy_preset,
+                rbf=rbf if rbf is not None else False,
+                locktime_override=locktime_override,
+                shuffle_inputs=shuffle_inputs if shuffle_inputs is not None else False,
+                shuffle_outputs=shuffle_outputs if shuffle_outputs is not None else False,
+                avoid_change=avoid_change if avoid_change is not None else False,
+                min_change_sats=min_change_sats,
+                include_global_xpub=include_global_xpub if include_global_xpub is not None else True,
+                include_keypaths=include_keypaths if include_keypaths is not None else True,
+                prefer_legacy_witness_utxo=prefer_legacy_witness_utxo if prefer_legacy_witness_utxo is not None else False,
+                shuffle_seed=shuffle_seed,
             )
             if auto.get("success"):
                 auto["selection_mode"] = "auto_fallback"
@@ -925,16 +1040,17 @@ def create_transaction_manual(
             network=network,
             fee_rate=fee_rate,
             manual_selected_utxos=selected,
-            # Explicit flags chosen by agent policy (do not pass privacy_preset here)
-            shuffle_inputs=bool(flags.get("shuffle_inputs", False)),
-            shuffle_outputs=bool(flags.get("shuffle_outputs", False)),
-            avoid_change=bool(flags.get("avoid_change", False)),
-            min_change_sats=int(flags.get("min_change_sats", 5000)),
-            include_global_xpub=bool(flags.get("include_global_xpub", False)),
-            include_keypaths=bool(flags.get("include_keypaths", False)),
-            rbf=bool(flags.get("rbf", True)),
-            prefer_legacy_witness_utxo=bool(flags.get("prefer_legacy_witness_utxo", False)),
-            shuffle_seed=int(flags.get("shuffle_seed", 0)),
+            privacy_preset=privacy_preset,
+            rbf=rbf if rbf is not None else bool(flags.get("rbf", True)),
+            locktime_override=locktime_override,
+            shuffle_inputs=shuffle_inputs if shuffle_inputs is not None else bool(flags.get("shuffle_inputs", False)),
+            shuffle_outputs=shuffle_outputs if shuffle_outputs is not None else bool(flags.get("shuffle_outputs", False)),
+            avoid_change=avoid_change if avoid_change is not None else bool(flags.get("avoid_change", False)),
+            min_change_sats=min_change_sats if min_change_sats is not None else int(flags.get("min_change_sats", 5000)),
+            include_global_xpub=include_global_xpub if include_global_xpub is not None else bool(flags.get("include_global_xpub", False)),
+            include_keypaths=include_keypaths if include_keypaths is not None else bool(flags.get("include_keypaths", False)),
+            prefer_legacy_witness_utxo=prefer_legacy_witness_utxo if prefer_legacy_witness_utxo is not None else bool(flags.get("prefer_legacy_witness_utxo", False)),
+            shuffle_seed=shuffle_seed if shuffle_seed is not None else int(flags.get("shuffle_seed", 0)),
         )
         if build.get("success"):
             build["selection_mode"] = "manual"
