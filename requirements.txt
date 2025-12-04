@@ -1,0 +1,38 @@
+############################################################
+# Minimal runtime dependencies for bitcoin-agent-project
+# Reduced from original bloated list (~80+) to only modules
+# actually imported in source code (see Pylance import scan).
+#
+# If you need dev/test tooling, add them in a separate
+# dev-requirements.txt or a pyproject.toml [project.optional-dependencies].
+############################################################
+
+# Core Bitcoin derivation helper
+hdwallet==3.6.1
+base58==2.1.1
+
+# HTTP & env config
+requests==2.32.4
+python-dotenv==1.1.1
+
+# Agent / LLM stack (only the pieces we import directly)
+langchain-openai==0.3.29
+langchain-core==0.3.74
+langgraph==0.6.4
+openai==1.99.3
+
+# Optional LLM providers (uncomment to enable Claude or Gemini)
+# langchain-anthropic>=0.3.0    # For Claude models
+# langchain-google-genai>=2.0.0 # For Gemini models
+
+# Console UX
+rich==14.1.0
+
+# (Optional for running test suite) pytest can be installed separately
+# pytest==8.3.3
+
+# Notes:
+# - langchain-openai pulls necessary transitive deps (httpx, pydantic, etc.)
+# - Keep explicit pins for reproducibility; review monthly for CVEs.
+# - If future code uses additional langchain modules (community, text-splitters),
+#   add them explicitly rather than reintroducing the whole bundle.
