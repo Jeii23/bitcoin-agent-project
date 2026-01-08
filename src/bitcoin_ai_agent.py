@@ -34,7 +34,7 @@ logging.basicConfig(
 )
 
 # Silencia els logs sorollosos de biblioteques externes (només mostrem els nostres)
-for _noisy in ("httpcore", "httpx", "openai", "urllib3", "requests", "asyncio", "langchain", "langgraph"):
+for _noisy in ("httpcore", "httpx", "openai", "anthropic", "urllib3", "requests", "asyncio", "langchain", "langgraph", "google"):
     logging.getLogger(_noisy).setLevel(logging.WARNING)
 
 # LangChain i LangGraph
@@ -314,6 +314,34 @@ def _normalize_address(addr: Optional[str]) -> Optional[str]:
     return s
 
 
+def _extract_text_content(content) -> str:
+    """Extract plain text from LLM response content.
+
+    Handles different response formats:
+    - str: returned as-is
+    - list of dicts with 'text' key (Gemini format): concatenates all text parts
+    - list of dicts with 'type'='text' (OpenAI/Anthropic format): extracts text
+    - other: converts to string
+    """
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        texts = []
+        for item in content:
+            if isinstance(item, dict):
+                # Gemini/OpenAI format: {'type': 'text', 'text': '...'}
+                if 'text' in item:
+                    texts.append(str(item['text']))
+                elif 'content' in item:
+                    texts.append(str(item['content']))
+            elif isinstance(item, str):
+                texts.append(item)
+        return "\n".join(texts) if texts else str(content)
+    return str(content)
+
+
 def _sanitize_psbt_b64(b64_text: str) -> str:
     """Sanitize a PSBT base64 string by removing whitespace and validating magic bytes.
 
@@ -391,11 +419,15 @@ def _provider_sequence(network: str):
 
 def _core_rpc_endpoint() -> str:
     """Build Bitcoin Core RPC URL. Supports /wallet/<name> via BITCOIN_RPC_WALLET env."""
+    from urllib.parse import quote
     user = os.getenv("BITCOIN_RPC_USER")
     pwd = os.getenv("BITCOIN_RPC_PASSWORD")
     host = os.getenv("BITCOIN_RPC_HOST")
     port = os.getenv("BITCOIN_RPC_PORT")
-    base = f"http://{user}:{pwd}@{host}:{port}"
+    # URL-encode user and password to handle special characters like @, !, etc.
+    user_enc = quote(user, safe="") if user else ""
+    pwd_enc = quote(pwd, safe="") if pwd else ""
+    base = f"http://{user_enc}:{pwd_enc}@{host}:{port}"
     wallet = os.getenv("BITCOIN_RPC_WALLET") or os.getenv("BITCOIN_WALLET") or os.getenv("BITCOIN_CORE_WALLET")
     return f"{base}/wallet/{wallet}" if wallet else base
 
@@ -1032,12 +1064,13 @@ def create_transaction_manual(
     psbt_extras: Dict - ADVANCED PSBT METADATA INJECTION
     ══════════════════════════════════════════════════════════════════════════════
 
-    This allows injecting ANY BIP-174/BIP-371 fields into the PSBT:
+    This allows injecting BIP-174/BIP-371 fields into the PSBT.
+    NOTE: PSBT version is ALWAYS 0 (BIP-174). Version 2 (BIP-370) is NOT supported
+    by most wallets (Electrum, hardware wallets, etc.) and will be ignored.
 
     psbt_extras.global: Dict
-        - "version": int                    # PSBT version (0 or 2)
-        - "fallback_locktime": int          # BIP-370 fallback locktime
-        - "tx_modifiable": int              # BIP-370 modifiable flags
+        - "fallback_locktime": int          # BIP-370 fallback locktime (ignored in v0)
+        - "tx_modifiable": int              # BIP-370 modifiable flags (ignored in v0)
         - "proprietary": List[Dict]         # Vendor-specific data
             [{"prefix_hex": "...", "subtype": int, "keydata_hex": "...", "value_hex": "..."}]
         - "raw_kv": List[Dict]              # Arbitrary key-value pairs
@@ -1221,9 +1254,18 @@ def create_transaction_manual(
         if locktime_override is not None:
             kwargs["locktime_override"] = int(locktime_override)
 
-        # Injecció PSBT addicional
+        # Injecció PSBT addicional (filtrant camps no suportats)
         if psbt_extras is not None:
-            kwargs["psbt_extras"] = psbt_extras
+            # Filter out unsupported PSBT version - only v0 (BIP-174) is supported
+            # PSBT v2 (BIP-370) is rejected by most wallets including Electrum
+            filtered_extras = dict(psbt_extras)
+            if isinstance(filtered_extras.get("global"), dict):
+                filtered_global = dict(filtered_extras["global"])
+                if "version" in filtered_global:
+                    logger.warning("PSBT version parameter ignored - only v0 (BIP-174) is supported")
+                    del filtered_global["version"]
+                filtered_extras["global"] = filtered_global
+            kwargs["psbt_extras"] = filtered_extras
 
         creator = PSBTCreator(network=network)  # només per validar adreces si cal
         total_input = sum(int(u.get("value_satoshis", 0)) for u in selected)
@@ -1441,42 +1483,63 @@ class BitcoinAIAgent:
         memory = MemorySaver()
         return workflow.compile(checkpointer=memory)
     
+    def _get_system_prompt(self) -> str:
+        """Returns the system prompt for the agent."""
+        return f"""Ets un agent expert en Bitcoin que ajuda els usuaris a gestionar les seves wallets amb suport per PSBTs BIP-174 estàndard.
+
+        Informació de context:
+        - XPUB: {self.xpub}
+        - Network: {self.network}
+
+        EINES DISPONIBLES:
+
+        1. get_balance(xpub, network)
+        Consulta el balanç total de la wallet escanejant les adreces derivades.
+
+        2. generate_address(xpub, network, index, require_unused, max_scan)
+        Genera una adreça de recepció. Per defecte busca la primera adreça sense ús.
+
+        3. list_utxos(xpub, network)
+        Llista totes les UTXOs disponibles amb detalls (txid, vout, valor, adreça).
+
+        4. get_fee_rates(network)
+        Obté les fee rates actuals de la xarxa (fastest, half_hour, hour, economy).
+
+        5. verify_utxo(txid, network)
+        Verifica si una transacció existeix i retorna els seus outputs i estat.
+
+        6. create_transaction_manual(xpub, recipient_address, amount_sats, utxo_ids, network, ...)
+        Crea un PSBT BIP-174 amb selecció manual d'UTXOs.
+        - utxo_ids: llista de "txid:vout" a gastar
+        - tx_opts: opcions avançades (fee_satoshis, outputs, rbf, locktime_override, etc.)
+        - psbt_extras: metadades PSBT addicionals (Taproot, BIP32 paths, etc.)
+
+        7. decode_psbt(psbt_string)
+        Decodifica i valida un PSBT en format base64.
+
+        INSTRUCCIONS:
+        - Quan cridis eines, usa sempre: {{"xpub": "{self.xpub}", "network": "{self.network}"}}
+        - Respon sempre en català
+        - Quan crees transaccions, genera PSBTs BIP-174 estàndard compatibles amb Electrum, Bitcoin Core i hardware wallets
+        - Guarda els PSBTs creats i ofereix-los en format base64 i fitxer
+        - Per crear una transacció, primer llista les UTXOs disponibles (list_utxos) per escollir quines gastar
+        """
+
     def _agent_node(self, state: AgentState) -> AgentState:
-        """Node de l'agent amb LLM millorat per PSBTs"""
+        """Node de l'agent amb LLM millorat per PSBTs.
         
-        # System prompt actualitzat
-        if not state["messages"] or not isinstance(state["messages"][0], SystemMessage):
-            psbt_info = "amb suport per PSBTs BIP-174 estàndard"
-            
-            system_prompt = f"""Ets un agent expert en Bitcoin que ajuda els usuaris a gestionar les seves wallets {psbt_info}.
-            
-            Informació de context:
-            - XPUB: {self.xpub}
-            - Network: {self.network}
-            - PSBT Support: {'BIP-174 Standard'}
-            
-            Tens accés a aquestes eines:
-            - get_balance: Per consultar el balanç
-            - generate_address: Per generar noves adreces
-            - list_utxos: Per veure les UTXOs disponibles
-            - get_fee_rates: Per consultar les fees actuals
-            - create_transaction: Per crear transaccions {'(PSBT BIP-174)'}
-            - create_transaction_manual: Per crear una transacció indicant EXACTAMENT quines UTXOs (format txid:vout) i una fee rate
-            - decode_psbt: Per decodificar i validar PSBTs {'(disponible)'}
-            
-            IMPORTANT:
-            - Sempre proporciona TOTS els paràmetres necessaris per les eines
-            - Quan cridis eines, usa exactament: {{"xpub": "{self.xpub}", "network": "{self.network}"}}
-            - Respon sempre en català
-            - Si crees una transacció, explica si és un PSBT estàndard o format simplificat
-            - Guarda els PSBTs creats per si l'usuari els vol després
-            """
-            
-            state["messages"] = [SystemMessage(content=system_prompt)] + state["messages"]
+        IMPORTANT: To avoid 'multiple non-consecutive system messages' errors with
+        Anthropic/Claude, we do NOT modify state["messages"] with the SystemMessage.
+        Instead, we build messages_for_llm separately for invocation.
+        """
+        # Build messages for LLM invocation without modifying state directly
+        # Filter out any existing SystemMessages and prepend a single one
+        non_system_msgs = [m for m in state["messages"] if not isinstance(m, SystemMessage)]
+        messages_for_llm = [SystemMessage(content=self._get_system_prompt())] + non_system_msgs
         
         # Generate LLM response
         try:
-            response = self.llm.invoke(state["messages"])
+            response = self.llm.invoke(messages_for_llm)
             
             if hasattr(response, "tool_calls") and response.tool_calls:
                 logger.debug("Tool calls: %d", len(response.tool_calls))
@@ -1643,7 +1706,7 @@ class BitcoinAIAgent:
             for msg in reversed(result["messages"]):
                 if isinstance(msg, AIMessage) and not isinstance(msg, ToolMessage):
                     if hasattr(msg, "tool_calls") and not msg.tool_calls:
-                        final_response = msg.content
+                        final_response = _extract_text_content(msg.content)
                         if psbt_created:
                             # Netejar qualsevol espai/blanc accidental i validar via decodificador intern
                             clean_psbt = _sanitize_psbt_b64(psbt_created)
@@ -1679,7 +1742,7 @@ class BitcoinAIAgent:
                                     logger.warning("Detected %d PSBTs in final text; should be 1", cnt)
                         break
                     elif not hasattr(msg, "tool_calls"):
-                        final_response = msg.content
+                        final_response = _extract_text_content(msg.content)
                         break
 
             # Update memory with messages from graph
