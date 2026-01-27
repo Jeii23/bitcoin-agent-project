@@ -29,3 +29,8 @@ data/
 .pytest_cache/
 .coverage
 htmlcov/
+
+# Experiments results
+experiments/results/
+experiments/*.base64
+experiments/*.psbt

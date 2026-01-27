@@ -28,6 +28,11 @@ openai==1.99.3
 # Console UX
 rich==14.1.0
 
+# Boltzmann entropy analysis (for privacy scoring)
+sympy>=1.12
+mpmath>=1.3.0
+sortedcontainers>=2.4.0
+
 # (Optional for running test suite) pytest can be installed separately
 # pytest==8.3.3
 

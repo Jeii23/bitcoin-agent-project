@@ -111,14 +111,42 @@ res = create_transaction_psbt(
 ## Conversational Agent (Optional)
 Set environment variables in `.env`:
 ```
-OPENAI_API_KEY=sk-...
+# Required: API key for your chosen LLM provider
+OPENAI_API_KEY=sk-...          # For OpenAI GPT models
+ANTHROPIC_API_KEY=sk-ant-...   # For Anthropic Claude models
+GOOGLE_API_KEY=AI...           # For Google Gemini models
+OPENROUTER_API_KEY=sk-or-...   # For OpenRouter (200+ models via single API)
+
+# LLM provider selection (default: openai)
+LLM_PROVIDER=openai            # Options: openai, anthropic, google, openrouter
+LLM_MODEL=gpt-4o               # Override default model for provider
+
+# Bitcoin configuration
 BITCOIN_XPUB=your_testnet_xpub
 BITCOIN_NETWORK=testnet
 ```
+
+### Supported LLM Providers
+| Provider | Default Model | Example Models |
+| -------- | ------------- | -------------- |
+| `openai` | gpt-4o | gpt-4o, gpt-4o-mini, gpt-4-turbo, o1, o3 |
+| `anthropic` | claude-sonnet-4 | claude-sonnet-4, claude-opus-4, claude-3.5-sonnet |
+| `google` | gemini-1.5-pro | gemini-1.5-pro, gemini-1.5-flash, gemini-2.0-flash-exp |
+| `openrouter` | anthropic/claude-sonnet-4 | meta-llama/llama-3.3-70b-instruct, deepseek/deepseek-r1, mistralai/mistral-large, qwen/qwen-2.5-72b-instruct |
+
+**OpenRouter** provides access to 200+ models (Llama, DeepSeek, Qwen, Mistral, and more) through a single API. Get your key at [openrouter.ai](https://openrouter.ai/).
+
 Run an interaction (example sketch):
-```
+```python
 from bitcoin_ai_agent import BitcoinAIAgent
-agent = BitcoinAIAgent(openai_api_key=os.getenv("OPENAI_API_KEY"))
+import asyncio, os
+
+# Option 1: Use default provider from .env
+agent = BitcoinAIAgent()
+
+# Option 2: Explicitly select provider
+agent = BitcoinAIAgent(llm_provider="openrouter", llm_model="meta-llama/llama-3.3-70b-instruct")
+
 agent.setup(os.getenv("BITCOIN_XPUB"), "testnet")
 response = asyncio.run(agent.chat("Crea una transacció de 0.001 BTC a tb1q..."))
 print(response)

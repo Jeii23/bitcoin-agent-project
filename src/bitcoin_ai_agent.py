@@ -12,7 +12,7 @@ import base64
 import re
 import logging
 import time
-from typing import TypedDict, List, Dict, Optional, Literal, Annotated, Sequence, Tuple
+from typing import TypedDict, List, Dict, Optional, Literal, Annotated, Sequence, Tuple, Any
 from decimal import Decimal
 from datetime import datetime
 import requests
@@ -98,12 +98,13 @@ load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 DEFAULT_XPUB = os.getenv("BITCOIN_XPUB", "")
 DEFAULT_NETWORK = os.getenv("BITCOIN_NETWORK", "testnet").lower()
 # Note: Removed legacy privacy_preset handling; behavior now configured only via explicit flags.
 
 # LLM Provider configuration
-# Set LLM_PROVIDER to "openai", "anthropic", or "google" to switch models
+# Set LLM_PROVIDER to "openai", "anthropic", "google", or "openrouter" to switch models
 # Set LLM_MODEL to override the default model for the provider
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "openai").lower()
 LLM_MODEL = os.getenv("LLM_MODEL", "")  # Empty = use provider default
@@ -135,6 +136,36 @@ LLM_PROVIDERS = {
         "models": ["gemini-1.5-pro", "gemini-1.5-flash", "gemini-pro", "gemini-2.0-flash-exp"],
         "env_key": "GOOGLE_API_KEY",
     },
+    "openrouter": {
+        "default_model": "anthropic/claude-sonnet-4",
+        "models": [
+            # Anthropic via OpenRouter
+            "anthropic/claude-sonnet-4",
+            "anthropic/claude-opus-4",
+            "anthropic/claude-3.5-sonnet",
+            "anthropic/claude-3-opus",
+            # OpenAI via OpenRouter
+            "openai/gpt-4o",
+            "openai/gpt-4-turbo",
+            "openai/o1",
+            # Meta Llama
+            "meta-llama/llama-3.3-70b-instruct",
+            "meta-llama/llama-3.1-405b-instruct",
+            # Google via OpenRouter
+            "google/gemini-2.0-flash-exp:free",
+            "google/gemini-pro-1.5",
+            # DeepSeek
+            "deepseek/deepseek-r1",
+            "deepseek/deepseek-chat",
+            # Mistral
+            "mistralai/mistral-large",
+            "mistralai/mixtral-8x22b-instruct",
+            # Qwen
+            "qwen/qwen-2.5-72b-instruct",
+        ],
+        "env_key": "OPENROUTER_API_KEY",
+        "base_url": "https://openrouter.ai/api/v1",
+    },
 }
 
 
@@ -149,7 +180,8 @@ def create_llm(
     Factory function to create an LLM instance with tool binding.
 
     Args:
-        provider: LLM provider ("openai", "anthropic", "google"). Defaults to LLM_PROVIDER env.
+        provider: LLM provider ("openai", "anthropic", "google", "openrouter"). 
+                  Defaults to LLM_PROVIDER env.
         model: Specific model name. Defaults to LLM_MODEL env or provider's default.
         api_key: API key override. Falls back to environment variable.
         temperature: Temperature setting for generation.
@@ -170,6 +202,9 @@ def create_llm(
 
         # Use Gemini with specific API key
         llm = create_llm(provider="google", api_key="my-key", tools=my_tools)
+
+        # Use OpenRouter with Llama model
+        llm = create_llm(provider="openrouter", model="meta-llama/llama-3.3-70b-instruct", tools=my_tools)
     """
     # Resolve provider from env if not specified
     provider = (provider or LLM_PROVIDER).lower()
@@ -223,6 +258,23 @@ def create_llm(
             google_api_key=api_key,
             model=model,
             temperature=temperature,
+        )
+    elif provider == "openrouter":
+        # OpenRouter uses OpenAI-compatible API with custom base URL
+        # Supports 200+ models from various providers through a single endpoint
+        base_url = config.get("base_url", "https://openrouter.ai/api/v1")
+        # Optional: Add HTTP-Referer and X-Title headers for OpenRouter dashboard tracking
+        default_headers = {
+            "HTTP-Referer": os.getenv("OPENROUTER_REFERER", "https://github.com/bitcoin-ai-agent"),
+            "X-Title": os.getenv("OPENROUTER_TITLE", "Bitcoin AI Agent"),
+        }
+        llm = ChatOpenAI(
+            api_key=api_key,
+            model=model,
+            temperature=temperature,
+            streaming=False,
+            base_url=base_url,
+            default_headers=default_headers,
         )
     else:
         # This shouldn't happen given the earlier check, but be defensive
@@ -976,13 +1028,13 @@ def decode_psbt(psbt_string: str) -> Dict:
 def create_transaction_manual(
     xpub: str,
     recipient_address: str,
-    amount_sats: int,
-    utxo_ids: List[str],
+    amount_sats: Any,  # Accepta int o string per LLMs com Llama
+    utxo_ids: Any,     # Accepta List[str] o string JSON per LLMs com Llama
     fee_rate: int = 10,                  # mantingut per compatibilitat; no s'usa
     network: str = "testnet",
     change_index: int = 0,
-    tx_opts: Optional[Dict] = None,      # knobs explícits i sense política
-    psbt_extras: Optional[Dict] = None,  # claus PSBT addicionals
+    tx_opts: Any = None,      # Accepta Dict o string JSON per LLMs com Llama
+    psbt_extras: Any = None,  # Accepta Dict o string JSON per LLMs com Llama
     locktime_override: Optional[int] = None,  # NOVA: permet passar locktime directament
 ) -> Dict:
     """
@@ -1195,7 +1247,45 @@ def create_transaction_manual(
         {"success": False, "error": "description..."}
     """
     try:
-        # 0) Normalització d’adreça si s’usarà el mode simple
+        # ====== NORMALITZACIÓ DE PARÀMETRES ======
+        # Alguns LLMs (Llama, Qwen via OpenRouter) passen strings JSON en lloc d'objectes.
+        def _parse_if_string(val, expected_type, default=None):
+            """Parse JSON string to object if needed."""
+            if val is None or val == 'null':
+                return default
+            if isinstance(val, str):
+                try:
+                    parsed = json.loads(val)
+                    if expected_type == list and isinstance(parsed, list):
+                        return parsed
+                    if expected_type == dict and isinstance(parsed, dict):
+                        return parsed
+                except json.JSONDecodeError:
+                    pass
+                return default
+            return val
+        
+        # Normalitzar utxo_ids
+        if isinstance(utxo_ids, str):
+            utxo_ids = _parse_if_string(utxo_ids, list, [])
+        # Normalitzar tx_opts
+        if isinstance(tx_opts, str):
+            tx_opts = _parse_if_string(tx_opts, dict, None)
+        # Normalitzar psbt_extras
+        if isinstance(psbt_extras, str):
+            psbt_extras = _parse_if_string(psbt_extras, dict, None)
+        # Normalitzar amount_sats
+        if isinstance(amount_sats, str):
+            try:
+                amount_sats = int(amount_sats)
+            except ValueError:
+                return {"success": False, "error": f"amount_sats invàlid: {amount_sats}"}
+        # Validar tipus
+        if not isinstance(utxo_ids, list):
+            return {"success": False, "error": f"utxo_ids ha de ser una llista, rebut: {type(utxo_ids).__name__}"}
+        # ====== FI NORMALITZACIÓ ======
+        
+        # 0) Normalització d'adreça si s'usarà el mode simple
         use_outputs_mode = bool(tx_opts and isinstance(tx_opts.get("outputs"), list))
         if not use_outputs_mode:
             if not recipient_address:
@@ -1479,51 +1569,47 @@ class BitcoinAIAgent:
         
         workflow.add_edge("tools", "agent")
         
-        # Compilar amb memòria
+        # Compilar amb memòria i límit de recursió augmentat per models OpenRouter
         memory = MemorySaver()
         return workflow.compile(checkpointer=memory)
     
     def _get_system_prompt(self) -> str:
         """Returns the system prompt for the agent."""
-        return f"""Ets un agent expert en Bitcoin que ajuda els usuaris a gestionar les seves wallets amb suport per PSBTs BIP-174 estàndard.
+        return f"""Ets un agent expert en Bitcoin que crea PSBTs BIP-174 estàndard.
 
-        Informació de context:
-        - XPUB: {self.xpub}
-        - Network: {self.network}
+Informació de context:
+- XPUB: {self.xpub}
+- Network: {self.network}
 
-        EINES DISPONIBLES:
+EINES DISPONIBLES:
+1. list_utxos(xpub, network) - Llista UTXOs disponibles
+2. generate_address(xpub, network) - Genera una adreça de recepció
+3. get_fee_rates(network) - Obté fee rates actuals
+4. create_transaction_manual(xpub, recipient_address, amount_sats, utxo_ids, network, tx_opts, psbt_extras) - Crea PSBT
 
-        1. get_balance(xpub, network)
-        Consulta el balanç total de la wallet escanejant les adreces derivades.
+INSTRUCCIONS OBLIGATÒRIES:
+- USA SEMPRE xpub="{self.xpub}" i network="{self.network}" en TOTES les crides
+- Respon en català
+- NO PREGUNTIS CONFIRMACIÓ - actua directament
+- NO INVENTIS adreces ni txids - USA NOMÉS les dades retornades per les eines
 
-        2. generate_address(xpub, network, index, require_unused, max_scan)
-        Genera una adreça de recepció. Per defecte busca la primera adreça sense ús.
+REGLES PER CREAR PSBT (segueix EXACTAMENT aquest ordre):
+1. Crida list_utxos per obtenir UTXOs reals
+2. Crida generate_address per obtenir una adreça real del wallet
+3. Crida get_fee_rates per obtenir fees
+4. Crida create_transaction_manual amb:
+   - recipient_address: una adreça REAL retornada per generate_address (NO inventis!)
+   - utxo_ids: llista de "txid:vout" REALS retornats per list_utxos (NO inventis!)
+   - tx_opts: {{"fee_satoshis": X}} on X = vbytes_estimats * fee_rate
+   - psbt_extras: null (NO passar psbt_extras a menys que l'usuari ho demani explícitament)
+5. Retorna el PSBT a l'usuari IMMEDIATAMENT
 
-        3. list_utxos(xpub, network)
-        Llista totes les UTXOs disponibles amb detalls (txid, vout, valor, adreça).
-
-        4. get_fee_rates(network)
-        Obté les fee rates actuals de la xarxa (fastest, half_hour, hour, economy).
-
-        5. verify_utxo(txid, network)
-        Verifica si una transacció existeix i retorna els seus outputs i estat.
-
-        6. create_transaction_manual(xpub, recipient_address, amount_sats, utxo_ids, network, ...)
-        Crea un PSBT BIP-174 amb selecció manual d'UTXOs.
-        - utxo_ids: llista de "txid:vout" a gastar
-        - tx_opts: opcions avançades (fee_satoshis, outputs, rbf, locktime_override, etc.)
-        - psbt_extras: metadades PSBT addicionals (Taproot, BIP32 paths, etc.)
-
-        7. decode_psbt(psbt_string)
-        Decodifica i valida un PSBT en format base64.
-
-        INSTRUCCIONS:
-        - Quan cridis eines, usa sempre: {{"xpub": "{self.xpub}", "network": "{self.network}"}}
-        - Respon sempre en català
-        - Quan crees transaccions, genera PSBTs BIP-174 estàndard compatibles amb Electrum, Bitcoin Core i hardware wallets
-        - Guarda els PSBTs creats i ofereix-los en format base64 i fitxer
-        - Per crear una transacció, primer llista les UTXOs disponibles (list_utxos) per escollir quines gastar
-        """
+PROHIBIT:
+- NO preguntis "vols que...?" - ACTUA directament
+- NO inventis txids amb "..." o valors falsos
+- NO passis psbt_extras amb valors no-hexadecimals
+- NO facis més crides després de rebre un PSBT vàlid
+"""
 
     def _agent_node(self, state: AgentState) -> AgentState:
         """Node de l'agent amb LLM millorat per PSBTs.
@@ -1537,35 +1623,54 @@ class BitcoinAIAgent:
         non_system_msgs = [m for m in state["messages"] if not isinstance(m, SystemMessage)]
         messages_for_llm = [SystemMessage(content=self._get_system_prompt())] + non_system_msgs
         
-        # Generate LLM response
-        try:
-            response = self.llm.invoke(messages_for_llm)
-            
-            if hasattr(response, "tool_calls") and response.tool_calls:
-                logger.debug("Tool calls: %d", len(response.tool_calls))
-                for tc in response.tool_calls:
-                    logger.debug("  - %s: %s", tc['name'], tc['args'])
-                    
-                    # Track PSBT creation
-                    if tc['name'] == 'create_transaction':
-                        state["last_psbt"] = "pending"
-                    # Persist recipient address for confirmations
-                    try:
-                        if tc['name'] in ('create_transaction', 'create_transaction_manual'):
-                            args = tc.get('args') or {}
-                            ra = args.get('recipient_address')
-                            if ra:
-                                global _LAST_RECIPIENT_ADDRESS
-                                _LAST_RECIPIENT_ADDRESS = _normalize_address(ra) or ra
-                    except Exception:
-                        pass
-            
-            state["messages"].append(response)
-            
-        except Exception as e:
-            logger.error("Error in agent_node: %s", e)
-            error_msg = AIMessage(content=f"Ho sento, hi ha hagut un error: {str(e)}")
-            state["messages"].append(error_msg)
+        # Generate LLM response with retry logic for transient errors
+        max_retries = 3
+        retry_count = 0
+        last_error = None
+        
+        while retry_count <= max_retries:
+            try:
+                response = self.llm.invoke(messages_for_llm)
+                
+                if hasattr(response, "tool_calls") and response.tool_calls:
+                    logger.debug("Tool calls: %d", len(response.tool_calls))
+                    for tc in response.tool_calls:
+                        logger.debug("  - %s: %s", tc['name'], tc['args'])
+                        
+                        # Track PSBT creation
+                        if tc['name'] == 'create_transaction':
+                            state["last_psbt"] = "pending"
+                        # Persist recipient address for confirmations
+                        try:
+                            if tc['name'] in ('create_transaction', 'create_transaction_manual'):
+                                args = tc.get('args') or {}
+                                ra = args.get('recipient_address')
+                                if ra:
+                                    global _LAST_RECIPIENT_ADDRESS
+                                    _LAST_RECIPIENT_ADDRESS = _normalize_address(ra) or ra
+                        except Exception:
+                            pass
+                
+                state["messages"].append(response)
+                break  # Success, exit retry loop
+                
+            except Exception as e:
+                error_str = str(e)
+                # Check for retryable errors (rate limit 429, overloaded 529, unavailable 503)
+                if any(code in error_str for code in ['429', '529', '503', 'overloaded', 'rate_limit', 'UNAVAILABLE', 'Overloaded']):
+                    retry_count += 1
+                    if retry_count <= max_retries:
+                        import time
+                        wait_time = 2 ** retry_count * 5  # 10s, 20s, 40s
+                        logger.warning("Retryable error (attempt %d/%d), waiting %ds: %s", retry_count, max_retries, wait_time, e)
+                        time.sleep(wait_time)
+                        continue
+                
+                # Non-retryable error or max retries exceeded
+                logger.error("Error in agent_node: %s", e)
+                error_msg = AIMessage(content=f"Ho sento, hi ha hagut un error: {str(e)}")
+                state["messages"].append(error_msg)
+                break
         
         return state
     
@@ -1644,8 +1749,11 @@ class BitcoinAIAgent:
             }
         }
         
-        # Executar graf
-        config = {"configurable": {"thread_id": f"chat_{datetime.now().timestamp()}"}}
+        # Executar graf amb límit de recursió augmentat per models OpenRouter/Llama
+        config = {
+            "configurable": {"thread_id": f"chat_{datetime.now().timestamp()}"},
+            "recursion_limit": 50  # Augmentat de 25 a 50 per models que fan més crides
+        }
         
         try:
             result = await self.graph.ainvoke(state, config)
