@@ -55,7 +55,13 @@ try:
     # Try to load .env from project directory
     env_path = PROJECT_DIR / ".env"
     if env_path.exists():
-        load_dotenv(env_path)
+        load_dotenv(env_path, override=True)
+        # Clear proxy-injected base URLs not defined in .env (e.g. Claude Code SDK)
+        from dotenv import dotenv_values
+        env_keys = dotenv_values(env_path)
+        for var in ["ANTHROPIC_BASE_URL", "OPENAI_BASE_URL"]:
+            if var not in env_keys and var in os.environ:
+                del os.environ[var]
 except ImportError:
     # dotenv not available, try to load manually
     env_path = PROJECT_DIR / ".env"
@@ -284,13 +290,13 @@ class ExperimentRunner:
         return self._agent_class
     
     def _lazy_import_scorer(self):
-        """Lazy import of PrivacyScorer."""
+        """Lazy import of score_psbt_privacy from privacy_scorer_v2."""
         if self._privacy_scorer_class is None:
             try:
-                from privacy_scorer import PrivacyScorer
-                self._privacy_scorer_class = PrivacyScorer
+                from privacy_scorer_v2 import score_psbt_privacy
+                self._privacy_scorer_class = score_psbt_privacy
             except ImportError:
-                logger.warning("Could not import PrivacyScorer, scoring will be disabled")
+                logger.warning("Could not import privacy_scorer_v2, scoring will be disabled")
                 self._privacy_scorer_class = None
         return self._privacy_scorer_class
     
@@ -444,14 +450,14 @@ class ExperimentRunner:
                     (psbt_dir / f"{exp.id}_rep{repetition}.base64").write_text(psbt_base64)
                 
                 # Calculate privacy score
-                PrivacyScorer = self._lazy_import_scorer()
-                if PrivacyScorer:
+                score_psbt_privacy = self._lazy_import_scorer()
+                if score_psbt_privacy:
                     try:
-                        scorer = PrivacyScorer(network=exp.wallet.network)
-                        score, breakdown = scorer.score_psbt(psbt_base64)
+                        report = score_psbt_privacy(psbt_base64, network=exp.wallet.network)
+                        score = report.scores["overall"]
                         result.privacy_score = score
                         result.privacy_grade = self._get_grade(score)
-                        result.privacy_breakdown = breakdown
+                        result.privacy_breakdown = report.to_dict()
                         logger.info(f"  Privacy Score: {score}/100 ({result.privacy_grade})")
                     except Exception as e:
                         logger.warning(f"  Privacy scoring failed: {e}")

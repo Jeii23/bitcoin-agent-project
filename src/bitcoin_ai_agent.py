@@ -12,7 +12,7 @@ import base64
 import re
 import logging
 import time
-from typing import TypedDict, List, Dict, Optional, Literal, Annotated, Sequence, Tuple, Any
+from typing import TypedDict, List, Dict, Optional, Literal, Annotated, Sequence, Tuple, Any, Union
 from decimal import Decimal
 from datetime import datetime
 import requests
@@ -268,6 +268,10 @@ def create_llm(
             "HTTP-Referer": os.getenv("OPENROUTER_REFERER", "https://github.com/bitcoin-ai-agent"),
             "X-Title": os.getenv("OPENROUTER_TITLE", "Bitcoin AI Agent"),
         }
+        # Limit max_tokens to avoid 402 errors when credits are low
+        # OpenRouter calculates affordability based on max_tokens * price_per_token
+        # Default 16384 is sufficient for agent tasks and avoids hitting credit limits
+        openrouter_max_tokens = int(os.getenv("OPENROUTER_MAX_TOKENS", "16384"))
         llm = ChatOpenAI(
             api_key=api_key,
             model=model,
@@ -275,6 +279,7 @@ def create_llm(
             streaming=False,
             base_url=base_url,
             default_headers=default_headers,
+            max_tokens=openrouter_max_tokens,
         )
     else:
         # This shouldn't happen given the earlier check, but be defensive
@@ -1028,13 +1033,13 @@ def decode_psbt(psbt_string: str) -> Dict:
 def create_transaction_manual(
     xpub: str,
     recipient_address: str,
-    amount_sats: Any,  # Accepta int o string per LLMs com Llama
-    utxo_ids: Any,     # Accepta List[str] o string JSON per LLMs com Llama
+    amount_sats: Union[int, str],  # Accepta int o string per LLMs com Llama
+    utxo_ids: Union[List[str], str],  # Accepta List[str] o string JSON per LLMs com Llama
     fee_rate: int = 10,                  # mantingut per compatibilitat; no s'usa
     network: str = "testnet",
     change_index: int = 0,
-    tx_opts: Any = None,      # Accepta Dict o string JSON per LLMs com Llama
-    psbt_extras: Any = None,  # Accepta Dict o string JSON per LLMs com Llama
+    tx_opts: Optional[Union[str, Dict]] = None,      # Accepta Dict o string JSON
+    psbt_extras: Optional[Union[str, Dict]] = None,   # Accepta Dict o string JSON
     locktime_override: Optional[int] = None,  # NOVA: permet passar locktime directament
 ) -> Dict:
     """
