@@ -33,11 +33,17 @@ sympy>=1.12
 mpmath>=1.3.0
 sortedcontainers>=2.4.0
 
+# Web UI (experiments dashboard)
+streamlit>=1.28.0
+pandas>=2.0.0
+altair>=5.0.0
+
 # (Optional for running test suite) pytest can be installed separately
 # pytest==8.3.3
 
 # Notes:
 # - langchain-openai pulls necessary transitive deps (httpx, pydantic, etc.)
+# - web UI uses Altair for paper-style charts
 # - Keep explicit pins for reproducibility; review monthly for CVEs.
 # - If future code uses additional langchain modules (community, text-splitters),
 #   add them explicitly rather than reintroducing the whole bundle.

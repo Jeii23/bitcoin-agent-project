@@ -1,150 +1,249 @@
 # Bitcoin Agent Privacy Experiments
 
-Sistema d'automatització d'experiments per avaluar la privacitat de les PSBTs generades per l'Agent Bitcoin amb diferents LLMs i configuracions.
+This directory contains the experiment workflow used to evaluate whether an xpub-only AI agent can construct Bitcoin PSBTs with better structural privacy.
 
-## Estructura
+The code is research tooling, not a production wallet. It never handles private keys, never signs transactions, and never broadcasts transactions. The agent can inspect wallet state from an extended public key, construct unsigned BIP-174 PSBTs, and pass those PSBTs to an offline privacy scorer.
 
+## What This Experiment System Does
+
+The experiment pipeline compares LLM providers, models, temperatures, prompt strategies, transaction amounts, repetitions, and follow-up prompts. Each experiment asks the Bitcoin agent to produce a PSBT. The runner saves the generated artifacts and, when the scorer is available, evaluates each PSBT with TxPrivScore.
+
+The core flow is:
+
+```text
+experiments.csv
+  -> experiment_runner.py
+  -> BitcoinAIAgent
+  -> generated PSBT
+  -> privacy_scorer_v2.py
+  -> results/experiments_*.csv + results/experiments_*.json + results/psbts/
 ```
+
+The Streamlit UI is a local helper on top of the same CSV and runner workflow. It exists to make experiment setup, execution, and comparison faster without changing the underlying pipeline.
+
+## Security Model
+
+- The agent is xpub-only.
+- Private keys are never loaded, requested, stored, signed with, or broadcast from this workflow.
+- Outputs are unsigned PSBTs intended for later human review and external signing.
+- The privacy scorer is offline and evaluates PSBT structure, not live blockchain behavior.
+- A high privacy score does not mean a PSBT is safe to sign; fee sanity and human review remain mandatory.
+
+## Directory Structure
+
+```text
 experiments/
-├── experiments.csv          # Definició dels experiments (editable amb Excel)
-├── experiment_runner.py     # Script d'execució
-├── results/                 # Resultats (generat automàticament)
-│   ├── experiments_*.csv    # Resultats resumits
-│   ├── experiments_*.json   # Resultats detallats
-│   └── psbts/              # PSBTs generades
-└── README.md               # Aquesta documentació
+├── experiments.csv          # Experiment definitions
+├── experiment_runner.py     # CLI runner and result writer
+├── web_ui.py                # Local Streamlit interface
+├── experiment_manager.py    # Backward-compatible CSV read/write helpers
+├── prompt_templates.py      # Prompt generation from amount + strategy
+├── result_utils.py          # CSV/JSON result loading and normalization
+├── paper_charts.py          # Optional chart helpers for result comparison
+└── README.md
 ```
 
-## Ús Ràpid
+Generated files are intentionally not part of the repository:
+
+```text
+experiments/results/
+experiments/results/psbts/
+experiments/*.psbt
+experiments/*.base64
+experiments/__pycache__/
+```
+
+These paths are ignored by `.gitignore` so local results and PSBT artifacts are not uploaded accidentally.
+
+## Requirements
+
+From the project root:
 
 ```bash
-# Des del directori del projecte
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+Configure API keys and Bitcoin settings in `.env` at the project root. Do not commit `.env`.
+
+Common variables:
+
+```text
+OPENAI_API_KEY=...
+ANTHROPIC_API_KEY=...
+GOOGLE_API_KEY=...
+OPENROUTER_API_KEY=...
+BITCOIN_XPUB=...
+BITCOIN_NETWORK=mainnet
+```
+
+The runner loads `.env` from the project root before importing the agent.
+
+## Running Experiments from the CLI
+
+Run commands from `bitcoin-agent-project/experiments`:
+
+```bash
 cd experiments
 
-# IMPORTANT: Usar el venv del projecte
-source ../.venv/bin/activate
-
-# Executar tots els experiments
-cd /home/jaume/feina/bitcoin-agent-project/experiments && /home/jaume/feina/bitcoin-agent-project/.venv/bin/python experiment_runner.py experiments.csv
-# Executar només experiments amb un tag específic
-python experiment_runner.py experiments.csv --filter tag:privacy-max
-
-# Executar experiments d'un sol proveïdor
-python experiment_runner.py experiments.csv --filter provider:openai
-
-# Executar un experiment concret per ID
-python experiment_runner.py experiments.csv --filter id:exp_openai_basic
-
-# Dry-run (validar CSV sense executar)
+# Validate parsing without running LLM calls
 python experiment_runner.py experiments.csv --dry-run
 
-# Amb més detalls de log
-python experiment_runner.py experiments.csv --verbose
+# Run all enabled experiments
+python experiment_runner.py experiments.csv
 
-# Intercalar per proveïdor (round-robin: evita rate limits)
-python experiment_runner.py experiments.csv --interleave
+# Run a single experiment
+python experiment_runner.py experiments.csv --filter id:exp_openai_basic
 
-# Afegir delay entre experiments (en segons)
-python experiment_runner.py experiments.csv --delay 5
+# Run several selected experiments into one result file
+python experiment_runner.py experiments.csv --filter ids:exp_openai_basic,exp_google_basic
 
-# Combinat: intercalar + delay de 3 segons
+# Filter by provider, model, tag, or name
+python experiment_runner.py experiments.csv --filter provider:openai
+python experiment_runner.py experiments.csv --filter model:gpt-5.2
+python experiment_runner.py experiments.csv --filter tag:privacy-simple
+python experiment_runner.py experiments.csv --filter name:basic
+
+# Reduce rate-limit pressure
 python experiment_runner.py experiments.csv --interleave --delay 3
 ```
 
-## Format CSV
-
-El fitxer `experiments.csv` es pot editar directament amb Excel o LibreOffice Calc.
-
-### Columnes
-
-| Columna | Descripció | Exemple |
-|---------|------------|---------|
-| `id` | Identificador únic | `exp_openai_basic` |
-| `name` | Nom descriptiu | `OpenAI GPT-5.1 - Basic` |
-| `provider` | Proveïdor LLM | `openai`, `anthropic`, `google` |
-| `model` | Model a usar | `gpt-5.1-chat-latest` |
-| `temperature` | Temperatura (0.0-2.0) | `1.0` |
-| `user_prompt` | Prompt de l'usuari | `Fes-me una PSBT de 3 BTC...` |
-| `followup_prompts` | Prompts addicionals (separats per `|`) | `Millora la privacitat|Afegeix més outputs` |
-| `repetitions` | Repeticions per estadística | `3` |
-| `timeout_seconds` | Timeout per experiment | `300` |
-| `network` | Xarxa Bitcoin | `mainnet`, `testnet` |
-| `tags` | Tags per filtrar (separats per `|`) | `openai|basic|baseline` |
-| `enabled` | Activat/desactivat | `true`, `false` |
-
-### Notes importants
-
-- **Múltiples followups**: Separa'ls amb `|` (pipe)
-- **Tags**: Separa'ls amb `|` (pipe)  
-- **Textos amb comes**: Envolta'ls amb cometes dobles `"text, amb comes"`
-- **Desactivar experiment**: Canvia `enabled` a `false`
-
-## Proveïdors LLM Suportats
-
-| Provider | Models Disponibles |
-|----------|-------------------|
-| `openai` | gpt-5.1-chat-latest, gpt-4o, gpt-4o-mini, o3, o1 |
-| `anthropic` | claude-opus-4-5-20251101, claude-sonnet-4-20250514 |
-| `google` | gemini-3-pro-preview, gemini-2.0-flash-exp |
-
-## Resultats
-
-### CSV (Resum)
-- `experiment_id`, `experiment_name`
-- `llm_provider`, `llm_model`, `llm_temperature`
-- `user_prompt`, `success`, `execution_time_seconds`
-- `psbt_generated`
-- `privacy_score` (0-100)
-- `privacy_grade` (A+, A, B, C, D, E, F)
-
-### JSON (Detallat)
-Inclou tot l'anterior més:
-- `privacy_breakdown` amb tots els factors de puntuació
-- Ruta al fitxer PSBT
-
-## Privacy Score
-
-| Factor | Penalització |
-|--------|-------------|
-| Canvi determinístic (decimal) | -25 punts |
-| Canvi optimal input | -15 punts |
-| Reutilització d'adreces | -30 punts |
-| Linkability / Baixa entropia | -20 punts |
-| Múltiples inputs | -10 punts |
-| Asimetria tipus adreça | -10 punts |
-| Quantitats rodones | -10 punts |
-| **Bonus: CoinJoin detectat** | +20 punts |
-
-## Afegir Nous Experiments
-
-1. Obre `experiments.csv` amb Excel/LibreOffice Calc
-2. Afegeix una nova fila amb un ID únic
-3. Desa el fitxer (format CSV)
-4. Valida: `python experiment_runner.py experiments.csv --dry-run`
-5. Executa: `python experiment_runner.py experiments.csv --filter id:<nou_id>`
-
-## Requisits
+Use `--verbose` when debugging:
 
 ```bash
-pip install -r requirements.txt
-
-# Variables d'entorn (.env)
-OPENAI_API_KEY=sk-...
-ANTHROPIC_API_KEY=sk-ant-...
-GOOGLE_API_KEY=AIza...
-XPUB=zpub6...
+python experiment_runner.py experiments.csv --filter id:exp_openai_basic --verbose
 ```
 
-## Anàlisi de Resultats
+## Running the Local Web UI
 
-```python
-import pandas as pd
+The UI is a local Streamlit app. It uses the same `experiments.csv` and calls `experiment_runner.py` through a subprocess.
 
-df = pd.read_csv("results/experiments_*.csv")
-
-# Mitjana per proveïdor
-df.groupby("llm_provider")["privacy_score"].mean()
-
-# Millor model
-df.groupby("llm_model")["privacy_score"].mean().sort_values(ascending=False)
+```bash
+cd experiments
+streamlit run web_ui.py
 ```
+
+Main UI capabilities:
+
+- inspect existing experiments from `experiments.csv`,
+- create, edit, or clone experiments,
+- control provider, model, temperature, repetitions, timeout, network, tags, and enabled state,
+- generate prompts from amount + strategy or preserve fully custom prompts,
+- run selected experiments through the CLI runner,
+- inspect result tables, scores, fee sanity, PSBT paths, and comparison charts.
+
+The UI is optional. Any experiment created by the UI is still represented as a CSV row and can be run from the CLI.
+
+## CSV Format
+
+The legacy runner fields remain the stable execution contract:
+
+| Column | Meaning |
+| --- | --- |
+| `id` | Unique experiment identifier |
+| `name` | Human-readable name |
+| `provider` | LLM provider: `openai`, `anthropic`, `google`, `openrouter` |
+| `model` | Provider model name |
+| `temperature` | LLM generation temperature |
+| `user_prompt` | Main request sent to the agent |
+| `followup_prompts` | Pipe-separated follow-up prompts |
+| `repetitions` | Number of repetitions |
+| `timeout_seconds` | Timeout per prompt call |
+| `network` | Bitcoin network, usually `mainnet` for the research setup |
+| `tags` | Pipe-separated tags for filtering and analysis |
+| `enabled` | `true` or `false` |
+
+The UI may add optional columns while preserving old rows:
+
+| Column | Meaning |
+| --- | --- |
+| `description` | Research notes |
+| `amount_btc` | Structured transaction amount used for template prompts |
+| `strategy` | Prompt strategy |
+| `prompt_mode` | `template` or `custom` |
+| `system_prompt` | Optional system prompt override |
+| `priority` | Optional ordering field |
+| `xpub` | Optional xpub override; empty means use `.env` |
+
+Legacy rows without `amount_btc`, `strategy`, or `prompt_mode` still work. The UI infers display values from tags and prompt text, but preserves manual prompt text unless template regeneration is explicitly used.
+
+## Prompt Strategies
+
+`prompt_templates.py` defines the currently supported Catalan prompt strategies:
+
+| Strategy | Behavior |
+| --- | --- |
+| `basic` | Functional request only: create a PSBT for the amount |
+| `privacy-simple` | One-shot request with a short privacy cue |
+| `multiturn-simple` | Basic request followed by a simple privacy-improvement follow-up |
+| `multiturn-detailed` | Basic request followed by detailed privacy instructions |
+| `privacy-detailed` | One-shot request with detailed privacy instructions |
+
+Historically, amount and privacy wording were embedded directly inside `user_prompt`. The structured fields make sweeps easier while keeping the generated prompt text visible and reproducible.
+
+## Scoring
+
+The runner imports the scorer lazily from:
+
+```text
+/home/jaume/feina/analysis/scoring/privacy_scorer_v2.py
+```
+
+In the full research workspace, this scorer is TxPrivScore v2 and evaluates PSBT structure offline. If the scorer cannot be imported, the runner keeps CLI compatibility and records results without privacy scores.
+
+Important result fields:
+
+| Field | Meaning |
+| --- | --- |
+| `privacy_score` | Overall structural privacy score, 0-100 |
+| `privacy_grade` | Letter grade derived from the score |
+| `fee_sanity_ok` | `1` when fees look sane, `0` when fees look astronomically wrong |
+| `sanity_status` | `ok`, `suspicious`, or `broken` |
+| `fee_rate_sat_vb` | Estimated fee rate, when available |
+| `fee_sats` | Estimated fee in satoshis, when available |
+| `psbt_file` | Path to the saved PSBT artifact |
+
+Treat `privacy_score` and fee sanity as separate dimensions. A PSBT can look structurally private while still being operationally unusable because of an absurd fee.
+
+## Results
+
+Each runner invocation writes a timestamped pair:
+
+```text
+results/experiments_YYYYMMDD_HHMMSS.csv
+results/experiments_YYYYMMDD_HHMMSS.json
+```
+
+The CSV is the compact summary. The JSON keeps detailed scorer breakdowns, agent responses, and PSBT metadata when available. Binary and Base64 PSBTs are saved under:
+
+```text
+results/psbts/
+```
+
+These files are local research artifacts and are intentionally ignored by Git.
+
+## Basic Checks
+
+From the project root:
+
+```bash
+# CSV parsing and runner wiring
+cd experiments
+python experiment_runner.py experiments.csv --dry-run --filter id:exp_openai_basic
+
+# Syntax check
+cd ..
+python -m py_compile experiments/*.py
+
+# UI/helper tests
+pytest -q tests/test_experiment_web_integration.py
+```
+
+The dry-run does not call LLM APIs. Running real experiments may use API credits and can take several minutes per experiment.
+
+## Research Notes
+
+This experiment system is designed to preserve backward compatibility with the CSV + runner workflow while adding structured controls for new research variables. The important current limitation is that some research factors are still encoded in natural language prompts. The UI and prompt templates make amount and prompt strategy first-class without forcing a breaking schema migration.
+
+The intended use is iterative local experimentation: define rows, run selected experiments, inspect generated PSBTs and scoring output, and compare how model and prompt choices affect privacy and fee sanity.

@@ -1,0 +1,1242 @@
+#!/usr/bin/env python3
+"""
+Bitcoin Agent Experiments Web UI
+=================================
+
+Streamlit-based web interface for managing and running Bitcoin privacy experiments.
+
+Usage:
+    streamlit run web_ui.py
+"""
+
+import streamlit as st
+import pandas as pd
+import subprocess
+import logging
+import sys
+from pathlib import Path
+from typing import List, Dict, Optional
+
+# Make local helper imports robust whether Streamlit is launched from
+# experiments/ or from the project root/testing harness.
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+from experiment_manager import ExperimentManager, ExperimentMeta, PromptStrategy
+from paper_charts import (
+    ANALYSIS_CHARTS_DIR,
+    PAPER_CHART_OPTIONS,
+    aggregate_current_results,
+    build_paper_chart,
+    current_results_v2_scores,
+    load_paper_chart_sources,
+    prepare_aggregated_dataframe,
+    prepare_v2_scores_dataframe,
+)
+from prompt_templates import generate_prompts
+from result_utils import arrow_safe_dataframe, display_columns, load_many_results_dataframes, load_results_dataframe
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Page configuration
+st.set_page_config(
+    page_title="Bitcoin Privacy Experiments",
+    page_icon="🔐",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+CSV_PATH = SCRIPT_DIR / "experiments.csv"
+RESULTS_DIR = SCRIPT_DIR / "results"
+
+
+PROVIDER_OPTIONS = ["openai", "anthropic", "google", "openrouter"]
+NETWORK_OPTIONS = ["mainnet", "testnet"]
+PROMPT_MODE_OPTIONS = ["template", "custom"]
+
+
+def get_manager() -> ExperimentManager:
+    """Get experiment manager instance."""
+    return ExperimentManager(CSV_PATH)
+
+
+def show_dataframe(df: pd.DataFrame, **kwargs):
+    """Display a dataframe after making object columns Arrow-compatible."""
+    st.dataframe(arrow_safe_dataframe(df), **kwargs)
+
+
+def show_pdf_preview(pdf_path: Path, *, height: int = 720):
+    """Embed a generated PDF chart in Streamlit."""
+    st.iframe(pdf_path, width="stretch", height=height)
+
+
+def load_css():
+    """Load custom CSS for better styling."""
+    st.markdown("""
+    <style>
+    .metric-card {
+        background-color: #f0f2f6;
+        padding: 15px;
+        border-radius: 8px;
+        margin: 10px 0;
+    }
+    .success-box { background-color: #d4edda; padding: 15px; border-radius: 5px; }
+    .error-box { background-color: #f8d7da; padding: 15px; border-radius: 5px; }
+    .warning-box { background-color: #fff3cd; padding: 15px; border-radius: 5px; }
+    </style>
+    """, unsafe_allow_html=True)
+
+
+def option_index(options: List[str], value: str, default: int = 0) -> int:
+    """Return a safe Streamlit selectbox index."""
+    return options.index(value) if value in options else default
+
+
+def truthy_series(series: pd.Series) -> pd.Series:
+    """Normalize CSV bool values that may arrive as bools or strings."""
+    values = series.astype("object").where(series.notna(), "")
+    return values.astype(str).str.lower().isin({"true", "1", "yes", "y"})
+
+
+def split_filter_values(value: str) -> List[str]:
+    """Split pasted ID/tag text on commas, pipes, whitespace, or newlines."""
+    if not value:
+        return []
+    normalized = value.replace("|", ",").replace("\n", ",").replace("\t", ",")
+    values = []
+    for chunk in normalized.split(","):
+        for item in chunk.split():
+            item = item.strip()
+            if item:
+                values.append(item)
+    return values
+
+
+def safe_prompt_mode(manager: ExperimentManager, exp: Dict, meta: ExperimentMeta) -> str:
+    """Return a prompt mode even if an older ExperimentMeta lacks the field."""
+    explicit = getattr(meta, "prompt_mode", None)
+    if explicit in PROMPT_MODE_OPTIONS:
+        return explicit
+    if hasattr(manager, "infer_prompt_mode"):
+        inferred = manager.infer_prompt_mode(exp)
+        if inferred in PROMPT_MODE_OPTIONS:
+            return inferred
+    raw = str(exp.get("prompt_mode", "")).strip().lower()
+    if raw in PROMPT_MODE_OPTIONS:
+        return raw
+    return "template" if exp.get("amount_btc") or exp.get("strategy") else "custom"
+
+
+def all_tags_from_dataframe(exp_df: pd.DataFrame) -> List[str]:
+    """Return sorted unique pipe-separated tags from an experiments dataframe."""
+    tags = set()
+    if "tags" not in exp_df.columns:
+        return []
+    for value in exp_df["tags"].fillna(""):
+        tags.update(tag.strip() for tag in str(value).split("|") if tag.strip())
+    return sorted(tags)
+
+
+def filter_run_experiments(
+    exp_df: pd.DataFrame,
+    *,
+    enabled_scope: str = "Enabled only",
+    providers: Optional[List[str]] = None,
+    models: Optional[List[str]] = None,
+    strategies: Optional[List[str]] = None,
+    networks: Optional[List[str]] = None,
+    prompt_modes: Optional[List[str]] = None,
+    tags: Optional[List[str]] = None,
+    tag_match: str = "Any selected tag",
+    search: str = "",
+    amount_range: Optional[tuple] = None,
+) -> pd.DataFrame:
+    """Apply the Run Experiments selection filters."""
+    if exp_df.empty:
+        return exp_df.copy()
+
+    filtered = exp_df.copy()
+
+    if enabled_scope == "Enabled only" and "enabled" in filtered.columns:
+        filtered = filtered[filtered["enabled"] == True]  # noqa: E712
+    elif enabled_scope == "Disabled only" and "enabled" in filtered.columns:
+        filtered = filtered[filtered["enabled"] == False]  # noqa: E712
+
+    for column, selected in (
+        ("provider", providers or []),
+        ("model", models or []),
+        ("strategy", strategies or []),
+        ("network", networks or []),
+        ("prompt_mode", prompt_modes or []),
+    ):
+        if selected and column in filtered.columns:
+            filtered = filtered[filtered[column].isin(selected)]
+
+    if tags and "tags" in filtered.columns:
+        wanted = set(tags)
+
+        def row_matches_tags(value: str) -> bool:
+            row_tags = {tag.strip() for tag in str(value or "").split("|") if tag.strip()}
+            if tag_match == "All selected tags":
+                return wanted.issubset(row_tags)
+            return bool(row_tags & wanted)
+
+        filtered = filtered[filtered["tags"].apply(row_matches_tags)]
+
+    if search:
+        needle = search.strip().lower()
+        if needle:
+            haystack = (
+                filtered.get("id", "").astype(str) + " "
+                + filtered.get("name", "").astype(str) + " "
+                + filtered.get("model", "").astype(str) + " "
+                + filtered.get("provider", "").astype(str) + " "
+                + filtered.get("tags", "").astype(str)
+            ).str.lower()
+            filtered = filtered[haystack.str.contains(needle, regex=False, na=False)]
+
+    if amount_range and "amount_btc" in filtered.columns:
+        min_amount, max_amount = amount_range
+        amounts = pd.to_numeric(filtered["amount_btc"], errors="coerce")
+        filtered = filtered[amounts.between(min_amount, max_amount, inclusive="both")]
+
+    return filtered
+
+
+def experiments_dataframe(manager: ExperimentManager, experiments: List[Dict]) -> pd.DataFrame:
+    """Build a display dataframe with inferred legacy fields."""
+    rows = []
+    for exp in experiments:
+        meta = manager.parse_csv_row_to_meta(exp)
+        prompt_mode = safe_prompt_mode(manager, exp, meta)
+        rows.append({
+            "id": meta.id,
+            "name": meta.name,
+            "provider": meta.provider,
+            "model": meta.model,
+            "strategy": meta.strategy,
+            "amount_btc": meta.amount_btc,
+            "prompt_mode": prompt_mode,
+            "temperature": meta.temperature,
+            "repetitions": meta.repetitions,
+            "timeout_seconds": meta.timeout_seconds,
+            "network": meta.network,
+            "enabled": meta.enabled,
+            "tags": "|".join(meta.tags),
+        })
+    return pd.DataFrame(rows)
+
+
+def build_runner_command(
+    selected_ids: List[str],
+    *,
+    interleave: bool = False,
+    delay: float = 0,
+    dry_run: bool = False,
+) -> List[str]:
+    """Build the CLI command the UI will execute."""
+    cmd = [
+        sys.executable,
+        str(SCRIPT_DIR / "experiment_runner.py"),
+        str(CSV_PATH),
+        "--output",
+        str(RESULTS_DIR),
+    ]
+    if selected_ids:
+        cmd.extend(["--filter", f"ids:{','.join(selected_ids)}"])
+    if interleave:
+        cmd.append("--interleave")
+    if delay > 0:
+        cmd.extend(["--delay", str(delay)])
+    if dry_run:
+        cmd.append("--dry-run")
+    return cmd
+
+
+def run_runner_command(cmd: List[str], timeout_seconds: Optional[int] = None) -> subprocess.CompletedProcess:
+    """Run the experiment runner from the experiments directory."""
+    return subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        cwd=SCRIPT_DIR,
+        timeout=timeout_seconds,
+    )
+
+
+def load_result_files() -> List[Path]:
+    """Get list of result CSV/JSON files."""
+    if not RESULTS_DIR.exists():
+        return []
+    csv_files = sorted(RESULTS_DIR.glob("experiments_*.csv"))
+    return csv_files
+
+
+def load_latest_results(manager: ExperimentManager) -> Optional[pd.DataFrame]:
+    """Load the most recent results CSV plus sibling JSON fields."""
+    files = load_result_files()
+    if not files:
+        return None
+    return load_results_dataframe(files[-1], manager=manager)
+
+
+def choose_results_dataframe(
+    manager: ExperimentManager,
+    *,
+    key_prefix: str,
+    default_scope: str = "All result files",
+) -> tuple[Optional[pd.DataFrame], List[Path]]:
+    """Let the user choose one, many, or all result files."""
+    result_files = load_result_files()
+    if not result_files:
+        return None, []
+
+    scope_options = ["All result files", "Latest result file", "Choose result files"]
+    scope = st.radio(
+        "Result scope",
+        scope_options,
+        index=option_index(scope_options, default_scope),
+        horizontal=True,
+        key=f"{key_prefix}_result_scope",
+    )
+
+    if scope == "All result files":
+        selected_files = result_files
+    elif scope == "Latest result file":
+        selected_files = [result_files[-1]]
+    else:
+        selected_files = st.multiselect(
+            "Result files",
+            result_files,
+            default=[result_files[-1]],
+            format_func=lambda p: p.name,
+            key=f"{key_prefix}_result_files",
+        )
+
+    if not selected_files:
+        st.warning("No result files selected.")
+        return None, []
+
+    results_df = load_many_results_dataframes(selected_files, manager=manager)
+    return results_df, selected_files
+
+
+def show_paper_chart_gallery(
+    results_df: Optional[pd.DataFrame] = None,
+    *,
+    key_prefix: str = "paper_charts",
+):
+    """Show paper-style charts backed by analysis/charts or the selected result file."""
+    st.subheader("Paper-Style Charts")
+
+    sources = load_paper_chart_sources()
+    source_options: List[str] = []
+    if results_df is not None and not results_df.empty:
+        source_options.append("Selected result data")
+    if not sources["aggregated"].empty:
+        source_options.append("analysis/charts aggregate")
+
+    if not source_options:
+        st.info("No chart data found in the selected results or analysis/charts.")
+        missing = sources.get("missing", [])
+        if missing:
+            with st.expander("Missing chart source files"):
+                for path in missing:
+                    st.code(path)
+        return
+
+    col1, col2 = st.columns([1, 2])
+    with col1:
+        data_source = st.radio(
+            "Chart data",
+            source_options,
+            horizontal=True,
+            key=f"{key_prefix}_source",
+        )
+    with col2:
+        chart_name = st.selectbox(
+            "Paper chart",
+            PAPER_CHART_OPTIONS,
+            key=f"{key_prefix}_chart",
+        )
+
+    if data_source == "Selected result data":
+        agg = aggregate_current_results(results_df)
+        v2_df = current_results_v2_scores(results_df)
+        st.caption("Built from the result rows currently loaded in the web UI.")
+    else:
+        agg = prepare_aggregated_dataframe(sources["aggregated"])
+        v2_df = prepare_v2_scores_dataframe(sources["v2_scores"])
+        st.caption(f"Loaded from {ANALYSIS_CHARTS_DIR}")
+
+    chart = build_paper_chart(chart_name, agg, v2_df)
+    if chart is None:
+        st.info("This chart needs score, fee, timing, or sub-score data that is not available for the selected source.")
+    else:
+        st.altair_chart(chart, width="stretch")
+
+    pdfs = sources.get("pdfs", [])
+    if pdfs:
+        st.subheader("Generated PDF Chart Preview")
+        selected_pdf = st.selectbox(
+            "Generated chart PDF",
+            pdfs,
+            format_func=lambda p: p.name,
+            key=f"{key_prefix}_pdf_preview",
+        )
+        show_pdf_preview(selected_pdf)
+    else:
+        st.info(f"No generated PDF charts found under {ANALYSIS_CHARTS_DIR / 'charts'}")
+
+    with st.expander("Generated PDF charts from analysis/charts"):
+        if not pdfs:
+            st.info(f"No PDF charts found under {ANALYSIS_CHARTS_DIR / 'charts'}")
+        else:
+            st.caption("Exact PDFs generated by the analysis/charts scripts.")
+            pdf_cols = st.columns(2)
+            for idx, pdf_path in enumerate(pdfs):
+                with pdf_cols[idx % 2]:
+                    st.download_button(
+                        f"Download {pdf_path.name}",
+                        data=pdf_path.read_bytes(),
+                        file_name=pdf_path.name,
+                        mime="application/pdf",
+                        key=f"{key_prefix}_pdf_{idx}_{pdf_path.stem}",
+                    )
+
+    with st.expander("Aggregated chart data"):
+        if agg.empty:
+            st.info("No aggregated rows available for this source.")
+        else:
+            show_dataframe(agg, width="stretch")
+
+
+def main():
+    """Main Streamlit app."""
+    load_css()
+
+    # Sidebar navigation
+    st.sidebar.title("🔐 Bitcoin Privacy Experiments")
+    page = st.sidebar.radio(
+        "Navigation",
+        [
+            "📊 Dashboard",
+            "🧪 Experiments Browser",
+            "➕ Create Experiment",
+            "✏️ Edit Experiment",
+            "📋 Clone Experiment",
+            "▶️ Run Experiments",
+            "📈 Results",
+            "🔍 Compare Results",
+        ],
+    )
+
+    manager = get_manager()
+
+    if page == "📊 Dashboard":
+        show_dashboard(manager)
+    elif page == "🧪 Experiments Browser":
+        show_experiments_browser(manager)
+    elif page == "➕ Create Experiment":
+        show_create_experiment(manager)
+    elif page == "✏️ Edit Experiment":
+        show_edit_experiment(manager)
+    elif page == "📋 Clone Experiment":
+        show_clone_experiment(manager)
+    elif page == "▶️ Run Experiments":
+        show_run_experiments(manager)
+    elif page == "📈 Results":
+        show_results(manager)
+    elif page == "🔍 Compare Results":
+        show_compare_results(manager)
+
+
+def show_dashboard(manager: ExperimentManager):
+    """Show main dashboard."""
+    st.title("🔐 Bitcoin Privacy Experiments Dashboard")
+
+    col1, col2, col3, col4 = st.columns(4)
+
+    # Count experiments
+    experiments = manager.read_experiments()
+    exp_df = experiments_dataframe(manager, experiments)
+    enabled_count = int(exp_df["enabled"].sum()) if not exp_df.empty else 0
+
+    with col1:
+        st.metric("Total Experiments", len(experiments))
+    with col2:
+        st.metric("Enabled", enabled_count)
+    with col3:
+        st.metric("Disabled", len(experiments) - enabled_count)
+
+    # Result files
+    result_files = load_result_files()
+    with col4:
+        st.metric("Result Files", len(result_files))
+
+    st.divider()
+
+    # Recent experiments table
+    st.subheader("📋 Recent Experiments (First 10)")
+    if not exp_df.empty:
+        df = exp_df.head(10)
+        display_cols = ['id', 'name', 'provider', 'model', 'strategy', 'amount_btc', 'enabled']
+        df_display = df[[c for c in display_cols if c in df.columns]]
+        show_dataframe(df_display, width='stretch')
+
+    # Recent results
+    st.subheader("📊 Latest Results")
+    results_df = load_latest_results(manager)
+    if results_df is not None:
+        st.write(f"**Loaded from**: {load_result_files()[-1].name if load_result_files() else 'N/A'}")
+
+        # Summary stats
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            success_rate = (truthy_series(results_df['success']).mean() * 100) if len(results_df) > 0 else 0
+            st.metric("Success Rate", f"{success_rate:.1f}%")
+        with col2:
+            avg_score = pd.to_numeric(results_df['privacy_score'], errors='coerce').mean()
+            st.metric("Avg Privacy Score", f"{avg_score:.1f}" if pd.notna(avg_score) else "N/A")
+        with col3:
+            psbt_gen_rate = (truthy_series(results_df['psbt_generated']).mean() * 100) if len(results_df) > 0 else 0
+            st.metric("PSBT Generation Rate", f"{psbt_gen_rate:.1f}%")
+
+        # Recent results table
+        recent = results_df.tail(10)
+        show_dataframe(recent[display_columns(recent.columns)], width='stretch')
+    else:
+        st.info("No results yet. Run some experiments to see results here.")
+
+    st.divider()
+    st.caption("💡 Tip: Use 'Run Experiments' to execute tests, then view results here.")
+
+
+def show_experiments_browser(manager: ExperimentManager):
+    """Browse and filter experiments."""
+    st.title("🧪 Experiments Browser")
+
+    experiments = manager.read_experiments()
+
+    if not experiments:
+        st.warning("No experiments found. Create one to get started!")
+        return
+    exp_df = experiments_dataframe(manager, experiments)
+
+    # Filters
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+        providers = sorted(exp_df['provider'].dropna().unique())
+        selected_provider = st.multiselect("Provider", providers, default=[])
+
+    with col2:
+        models = sorted(exp_df['model'].dropna().unique())
+        selected_model = st.multiselect("Model", models, default=[])
+
+    with col3:
+        strategies = sorted(exp_df['strategy'].dropna().unique())
+        selected_strategy = st.multiselect("Strategy", strategies, default=[])
+
+    # Filter experiments
+    filtered_df = exp_df.copy()
+    if selected_provider:
+        filtered_df = filtered_df[filtered_df['provider'].isin(selected_provider)]
+    if selected_model:
+        filtered_df = filtered_df[filtered_df['model'].isin(selected_model)]
+    if selected_strategy:
+        filtered_df = filtered_df[filtered_df['strategy'].isin(selected_strategy)]
+
+    st.subheader(f"Found {len(filtered_df)} experiments")
+
+    if not filtered_df.empty:
+        df = filtered_df
+        display_cols = [
+            'id', 'name', 'provider', 'model', 'strategy', 'amount_btc',
+            'prompt_mode', 'temperature', 'repetitions', 'enabled'
+        ]
+        df_display = df[[c for c in display_cols if c in df.columns]]
+        show_dataframe(df_display, width='stretch')
+
+        # Show details of selected experiment
+        selected_id = st.selectbox("Select experiment for details", filtered_df['id'].tolist())
+        if selected_id:
+            exp = manager.read_experiment_by_id(selected_id)
+            if exp:
+                meta = manager.parse_csv_row_to_meta(exp)
+                prompt_mode = safe_prompt_mode(manager, exp, meta)
+                st.subheader(f"Details: {selected_id}")
+
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.write(f"**Name**: {meta.name}")
+                    st.write(f"**Provider**: {meta.provider}")
+                    st.write(f"**Model**: {meta.model}")
+                    st.write(f"**Strategy**: {meta.strategy}")
+                    st.write(f"**Amount (BTC)**: {meta.amount_btc:g}")
+
+                with col2:
+                    st.write(f"**Prompt mode**: {prompt_mode}")
+                    st.write(f"**Temperature**: {meta.temperature}")
+                    st.write(f"**Repetitions**: {meta.repetitions}")
+                    st.write(f"**Timeout (s)**: {meta.timeout_seconds}")
+                    st.write(f"**Network**: {meta.network}")
+                    st.write(f"**Enabled**: {meta.enabled}")
+
+                st.subheader("Prompts")
+                st.text(f"User Prompt:\n{meta.user_prompt or 'N/A'}")
+
+                if meta.followup_prompts:
+                    for i, fp in enumerate(meta.followup_prompts, 1):
+                        st.text(f"Followup {i}:\n{fp}")
+
+                st.subheader("Tags")
+                if meta.tags:
+                    for tag in meta.tags:
+                        st.write(f"  • {tag}")
+
+
+def show_create_experiment(manager: ExperimentManager):
+    """Create a new experiment with interactive form."""
+    st.title("➕ Create New Experiment")
+
+    with st.form("create_exp_form"):
+        col1, col2 = st.columns(2)
+
+        with col1:
+            exp_id = st.text_input("Experiment ID (unique)", help="e.g., exp_claude_privacy_v2")
+            name = st.text_input("Name", help="e.g., Claude 3.5 Privacy Test")
+            description = st.text_area("Description", height=80)
+
+        with col2:
+            st.subheader("Parameters")
+            prompt_mode = st.radio("Prompt mode", PROMPT_MODE_OPTIONS, horizontal=True)
+            amount_btc = st.number_input("Amount (BTC)", min_value=0.0001, value=3.0, step=0.1)
+            strategy = st.selectbox("Strategy", [s.value for s in PromptStrategy])
+            temperature = st.slider("Temperature", min_value=0.0, max_value=2.0, value=1.0, step=0.1)
+
+        st.divider()
+
+        col1, col2, col3 = st.columns(3)
+
+        with col1:
+            provider = st.selectbox("Provider", ["openai", "anthropic", "google", "openrouter"])
+            model = st.text_input("Model", value="gpt-4o", help="Full model name (e.g., gpt-4o, claude-opus-4)")
+
+        with col2:
+            repetitions = st.number_input("Repetitions", min_value=1, max_value=10, value=3)
+            timeout_seconds = st.number_input("Timeout (seconds)", min_value=30, max_value=600, value=300)
+
+        with col3:
+            network = st.selectbox("Network", ["mainnet", "testnet"])
+            priority = st.number_input("Priority", min_value=1, max_value=10, value=1)
+
+        tags_input = st.text_input("Tags (comma-separated)", help="e.g., privacy, openai, baseline")
+        tags = [t.strip() for t in tags_input.split(',') if t.strip()] if tags_input else []
+
+        enabled = st.checkbox("Enabled", value=True)
+
+        if prompt_mode == "template":
+            prompts = generate_prompts(amount_btc, strategy, "ca")
+            st.subheader("Prompt Preview")
+            st.text(f"User Prompt:\n{prompts['user_prompt']}")
+            for i, fp in enumerate(prompts['followup_prompts'], 1):
+                st.text(f"Followup {i}:\n{fp}")
+            custom_user_prompt = ""
+            custom_followups_input = ""
+        else:
+            st.subheader("Custom Prompt")
+            custom_user_prompt = st.text_area("User Prompt", height=120)
+            custom_followups_input = st.text_area(
+                "Followups (one per line)",
+                help="The UI will store these as pipe-separated followup_prompts in the CSV.",
+                height=100,
+            )
+
+        submitted = st.form_submit_button("✓ Create Experiment")
+
+    if submitted:
+        if not exp_id:
+            st.error("Experiment ID is required")
+            return
+        if prompt_mode == "custom" and not custom_user_prompt.strip():
+            st.error("Custom prompt mode requires a user prompt")
+            return
+
+        try:
+            exp_meta = ExperimentMeta(
+                id=exp_id,
+                name=name or exp_id,
+                description=description,
+                amount_btc=amount_btc,
+                strategy=strategy,
+                provider=provider,
+                model=model,
+                temperature=temperature,
+                repetitions=repetitions,
+                timeout_seconds=timeout_seconds,
+                network=network,
+                tags=tags,
+                enabled=enabled,
+                priority=priority,
+                prompt_mode=prompt_mode,
+                user_prompt=custom_user_prompt,
+                followup_prompts=[line.strip() for line in custom_followups_input.splitlines() if line.strip()],
+            )
+
+            manager.add_experiment(exp_meta)
+            st.success(f"✓ Experiment '{exp_id}' created successfully!")
+
+            st.caption(f"Prompt mode: {prompt_mode}")
+
+        except Exception as e:
+            st.error(f"Error: {e}")
+
+
+def show_edit_experiment(manager: ExperimentManager):
+    """Edit an existing experiment."""
+    st.title("✏️ Edit Experiment")
+
+    experiments = manager.read_experiments()
+    if not experiments:
+        st.warning("No experiments to edit")
+        return
+
+    exp_id = st.selectbox("Select experiment to edit", [e['id'] for e in experiments])
+
+    exp = manager.read_experiment_by_id(exp_id)
+    if not exp:
+        st.error("Experiment not found")
+        return
+
+    # Parse into editable form
+    meta = manager.parse_csv_row_to_meta(exp)
+    current_prompt_mode = safe_prompt_mode(manager, exp, meta)
+
+    with st.form("edit_exp_form"):
+        col1, col2 = st.columns(2)
+
+        with col1:
+            name = st.text_input("Name", value=meta.name)
+            description = st.text_area("Description", value=meta.description, height=80)
+
+        with col2:
+            st.subheader("Parameters")
+            prompt_mode = st.radio(
+                "Prompt mode",
+                PROMPT_MODE_OPTIONS,
+                index=option_index(PROMPT_MODE_OPTIONS, current_prompt_mode),
+                horizontal=True,
+            )
+            amount_btc = st.number_input("Amount (BTC)", min_value=0.0001, value=meta.amount_btc, step=0.1)
+            strategy = st.selectbox("Strategy", [s.value for s in PromptStrategy], index=[s.value for s in PromptStrategy].index(meta.strategy))
+            temperature = st.slider("Temperature", min_value=0.0, max_value=2.0, value=meta.temperature, step=0.1)
+
+        st.divider()
+
+        col1, col2, col3 = st.columns(3)
+
+        with col1:
+            provider = st.selectbox("Provider", PROVIDER_OPTIONS, index=option_index(PROVIDER_OPTIONS, meta.provider))
+            model = st.text_input("Model", value=meta.model)
+
+        with col2:
+            repetitions = st.number_input("Repetitions", min_value=1, max_value=10, value=meta.repetitions)
+            timeout_seconds = st.number_input("Timeout (seconds)", min_value=30, max_value=600, value=meta.timeout_seconds)
+
+        with col3:
+            network = st.selectbox("Network", NETWORK_OPTIONS, index=option_index(NETWORK_OPTIONS, meta.network))
+            priority = st.number_input("Priority", min_value=1, max_value=10, value=meta.priority)
+
+        tags_input = st.text_input("Tags (comma-separated)", value=", ".join(meta.tags) if meta.tags else "")
+        tags = [t.strip() for t in tags_input.split(',') if t.strip()] if tags_input else []
+
+        enabled = st.checkbox("Enabled", value=meta.enabled)
+
+        if prompt_mode == "template":
+            prompts = generate_prompts(amount_btc, strategy, "ca")
+            st.subheader("Prompt Preview")
+            st.text(f"User Prompt:\n{prompts['user_prompt']}")
+            for i, fp in enumerate(prompts['followup_prompts'], 1):
+                st.text(f"Followup {i}:\n{fp}")
+            template_fields_changed = (
+                prompt_mode != current_prompt_mode
+                or amount_btc != meta.amount_btc
+                or strategy != meta.strategy
+            )
+            regenerate_prompts = st.checkbox(
+                "Regenerate prompts from template on save",
+                value=template_fields_changed,
+                help="Amount/strategy changes in Template mode regenerate automatically; this also lets you refresh unchanged template prompts.",
+            )
+            custom_user_prompt = meta.user_prompt
+            custom_followups_input = "\n".join(meta.followup_prompts)
+        else:
+            st.subheader("Custom Prompt")
+            custom_user_prompt = st.text_area("User Prompt", value=meta.user_prompt, height=120)
+            custom_followups_input = st.text_area(
+                "Followups (one per line)",
+                value="\n".join(meta.followup_prompts),
+                height=100,
+            )
+
+        submitted = st.form_submit_button("✓ Update Experiment")
+
+    if submitted:
+        try:
+            updates = {
+                'name': name,
+                'description': description,
+                'amount_btc': str(amount_btc),
+                'strategy': strategy,
+                'provider': provider,
+                'model': model,
+                'temperature': str(temperature),
+                'repetitions': str(repetitions),
+                'timeout_seconds': str(timeout_seconds),
+                'network': network,
+                'priority': str(priority),
+                'tags': tags,
+                'enabled': enabled,
+                'prompt_mode': prompt_mode,
+                '_regenerate_prompts': regenerate_prompts if prompt_mode == 'template' else False,
+            }
+            if prompt_mode == 'custom':
+                if not custom_user_prompt.strip():
+                    st.error("Custom prompt mode requires a user prompt")
+                    return
+                updates['user_prompt'] = custom_user_prompt
+                updates['followup_prompts'] = [line.strip() for line in custom_followups_input.splitlines() if line.strip()]
+
+            manager.update_experiment(exp_id, updates)
+            st.success(f"✓ Experiment '{exp_id}' updated successfully!")
+
+        except Exception as e:
+            st.error(f"Error: {e}")
+
+
+def show_clone_experiment(manager: ExperimentManager):
+    """Clone an existing experiment."""
+    st.title("📋 Clone Experiment")
+
+    experiments = manager.read_experiments()
+    if not experiments:
+        st.warning("No experiments to clone")
+        return
+
+    src_id = st.selectbox("Select source experiment", [e['id'] for e in experiments])
+
+    src_exp = manager.read_experiment_by_id(src_id)
+    if not src_exp:
+        st.error("Source experiment not found")
+        return
+    src_meta = manager.parse_csv_row_to_meta(src_exp)
+
+    st.subheader("Clone Settings")
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        new_id = st.text_input("New Experiment ID", value=f"{src_id}_v2", help="Must be unique")
+        modify_model = st.checkbox("Modify Model")
+
+    with col2:
+        modify_amount = st.checkbox("Modify Amount")
+        modify_strategy = st.checkbox("Modify Strategy")
+
+    new_model = None
+    new_amount = None
+    new_strategy = None
+    clone_prompt_mode = st.radio(
+        "Prompt handling",
+        ["keep current prompt text", "use template if amount/strategy changes"],
+        index=0,
+    )
+
+    if modify_model:
+        new_model = st.text_input("New Model", value=src_meta.model)
+
+    if modify_amount:
+        new_amount = st.number_input("New Amount (BTC)", min_value=0.0001, value=src_meta.amount_btc, step=0.1)
+
+    if modify_strategy:
+        new_strategy = st.selectbox("New Strategy", [s.value for s in PromptStrategy], index=[s.value for s in PromptStrategy].index(src_meta.strategy))
+
+    if st.button("✓ Clone Experiment"):
+        try:
+            updates = {}
+            if modify_model and new_model:
+                updates['model'] = new_model
+            if modify_amount and new_amount:
+                updates['amount_btc'] = str(new_amount)
+            if modify_strategy and new_strategy:
+                updates['strategy'] = new_strategy
+            if (modify_amount or modify_strategy) and clone_prompt_mode.startswith("use template"):
+                updates['prompt_mode'] = 'template'
+
+            manager.clone_experiment(src_id, new_id, updates)
+            st.success(f"✓ Experiment cloned to '{new_id}'!")
+
+        except Exception as e:
+            st.error(f"Error: {e}")
+
+
+def show_run_experiments(manager: ExperimentManager):
+    """Run experiments with various options."""
+    st.title("▶️ Run Experiments")
+
+    experiments = manager.read_experiments()
+    if not experiments:
+        st.warning("No experiments to run")
+        return
+
+    exp_df = experiments_dataframe(manager, experiments)
+    if exp_df.empty:
+        st.warning("No experiments to run")
+        return
+
+    st.subheader("Build Run Selection")
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        enabled_scope = st.radio(
+            "Enabled filter",
+            ["Enabled only", "All experiments", "Disabled only"],
+            horizontal=True,
+        )
+        selected_providers = st.multiselect("Provider", sorted(exp_df["provider"].dropna().unique()), default=[])
+        selected_strategies = st.multiselect("Strategy", sorted(exp_df["strategy"].dropna().unique()), default=[])
+    with col2:
+        selected_models = st.multiselect("Model", sorted(exp_df["model"].dropna().unique()), default=[])
+        selected_networks = st.multiselect("Network", sorted(exp_df["network"].dropna().unique()), default=[])
+        selected_prompt_modes = st.multiselect(
+            "Prompt mode",
+            sorted(exp_df["prompt_mode"].dropna().unique()),
+            default=[],
+        )
+    with col3:
+        search = st.text_input("Search ID / name / model / tags")
+        selected_tags = st.multiselect("Tags", all_tags_from_dataframe(exp_df), default=[])
+        tag_match = st.radio(
+            "Tag matching",
+            ["Any selected tag", "All selected tags"],
+            horizontal=True,
+            disabled=not selected_tags,
+        )
+
+    amount_range = None
+    amount_values = pd.to_numeric(exp_df["amount_btc"], errors="coerce").dropna()
+    if not amount_values.empty and amount_values.min() < amount_values.max():
+        amount_range = st.slider(
+            "Amount range (BTC)",
+            min_value=float(amount_values.min()),
+            max_value=float(amount_values.max()),
+            value=(float(amount_values.min()), float(amount_values.max())),
+        )
+    elif not amount_values.empty:
+        st.caption(f"Amount filter not shown: all visible experiments infer {amount_values.iloc[0]:g} BTC.")
+
+    filtered_df = filter_run_experiments(
+        exp_df,
+        enabled_scope=enabled_scope,
+        providers=selected_providers,
+        models=selected_models,
+        strategies=selected_strategies,
+        networks=selected_networks,
+        prompt_modes=selected_prompt_modes,
+        tags=selected_tags,
+        tag_match=tag_match,
+        search=search,
+        amount_range=amount_range,
+    )
+
+    st.subheader(f"Matching Experiments: {len(filtered_df)}")
+    preview_cols = [
+        "id", "name", "provider", "model", "strategy", "amount_btc",
+        "prompt_mode", "network", "enabled", "tags",
+    ]
+    show_dataframe(filtered_df[[c for c in preview_cols if c in filtered_df.columns]], width='stretch')
+
+    st.subheader("Choose Final IDs")
+    selection_mode = st.radio(
+        "Selection mode",
+        ["Pick from matching rows", "Run all matching rows", "Paste IDs"],
+        horizontal=True,
+    )
+
+    selected_ids: List[str] = []
+    filtered_ids = filtered_df["id"].tolist() if "id" in filtered_df.columns else []
+    id_labels = {
+        row["id"]: f"{row['id']} — {row['provider']} / {row['model']} / {row['strategy']}"
+        for _, row in filtered_df.iterrows()
+    }
+
+    if selection_mode == "Run all matching rows":
+        selected_ids = filtered_ids
+    elif selection_mode == "Paste IDs":
+        pasted_ids = split_filter_values(st.text_area("IDs to run", help="Comma, whitespace, newline or pipe separated."))
+        existing_ids = set(exp_df["id"].tolist())
+        unknown_ids = [exp_id for exp_id in pasted_ids if exp_id not in existing_ids]
+        selected_ids = [exp_id for exp_id in pasted_ids if exp_id in existing_ids]
+        if unknown_ids:
+            st.warning(f"Unknown IDs ignored: {', '.join(unknown_ids)}")
+    else:
+        selected_ids = st.multiselect(
+            "Specific matching experiments",
+            filtered_ids,
+            default=[],
+            format_func=lambda exp_id: id_labels.get(exp_id, exp_id),
+        )
+
+    limit_enabled = st.checkbox("Limit run count", value=False)
+    if limit_enabled and selected_ids:
+        limit_count = st.number_input("Max experiments to run", min_value=1, max_value=len(selected_ids), value=min(5, len(selected_ids)))
+        selected_ids = selected_ids[:int(limit_count)]
+
+    st.info(f"Selected {len(selected_ids)} experiments for this run.")
+    if selected_ids:
+        selected_preview = exp_df[exp_df["id"].isin(selected_ids)]
+        show_dataframe(selected_preview[[c for c in preview_cols if c in selected_preview.columns]], width='stretch')
+
+    st.divider()
+
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+        interleave = st.checkbox("Interleave by provider", help="Run experiments in round-robin order to avoid rate limits")
+
+    with col2:
+        delay = st.number_input("Delay between experiments (sec)", min_value=0, value=0, step=1)
+
+    with col3:
+        dry_run = st.checkbox("Dry run", help="Parse without executing")
+
+    if st.button("▶️ Start Running", type="primary"):
+        if not selected_ids:
+            st.error("No experiments selected")
+            return
+
+        st.subheader("Execution Progress")
+
+        selected_experiments = [e for e in experiments if e.get('id') in selected_ids]
+        selected_meta = [manager.parse_csv_row_to_meta(e) for e in selected_experiments]
+        estimated_timeout = int(
+            sum(meta.timeout_seconds * meta.repetitions for meta in selected_meta)
+            + max(60, delay * max(0, len(selected_ids) - 1) + 60)
+        )
+        if dry_run:
+            estimated_timeout = 120
+
+        cmd = build_runner_command(selected_ids, interleave=interleave, delay=delay, dry_run=dry_run)
+        st.code(" ".join(cmd), language="bash")
+
+        with st.spinner("Running dry-run..." if dry_run else "Running selected experiments..."):
+            try:
+                result = run_runner_command(cmd, timeout_seconds=estimated_timeout)
+            except subprocess.TimeoutExpired as exc:
+                st.error(f"Runner timed out after {estimated_timeout}s")
+                with st.expander("Partial stdout/stderr", expanded=True):
+                    st.text(exc.stdout or "")
+                    st.text(exc.stderr or "")
+                return
+
+        if result.returncode == 0:
+            st.success("✓ Runner completed successfully" if dry_run else "✓ Selected experiments completed")
+        else:
+            st.error(f"✗ Runner failed with exit code {result.returncode}")
+
+        with st.expander("Runner stdout", expanded=not dry_run):
+            st.code(result.stdout or "(empty)")
+        if result.stderr:
+            with st.expander("Runner stderr", expanded=True):
+                st.code(result.stderr)
+
+
+def show_results(manager: ExperimentManager):
+    """Visualize results."""
+    st.title("📈 Experiment Results")
+
+    result_files = load_result_files()
+    if not result_files:
+        st.info("No results yet. Run experiments to generate results.")
+        return
+
+    results_df, selected_files = choose_results_dataframe(
+        manager,
+        key_prefix="results",
+        default_scope="All result files",
+    )
+    if results_df is None or results_df.empty:
+        st.info("No rows found in the selected result files.")
+        return
+
+    col1, col2 = st.columns([3, 1])
+    with col1:
+        st.write(f"**Loaded files**: {len(selected_files)}")
+        st.caption(f"{len(results_df)} result rows loaded.")
+        with st.expander("Loaded result files"):
+            for path in selected_files:
+                st.code(path.name)
+    with col2:
+        if st.button("🔄 Reload"):
+            st.rerun()
+
+    # Summary stats
+    st.subheader("Summary Statistics")
+    col1, col2, col3, col4, col5 = st.columns(5)
+
+    total = len(results_df)
+    with col1:
+        st.metric("Total Runs", total)
+
+    successful = int(truthy_series(results_df['success']).sum()) if 'success' in results_df.columns else 0
+    with col2:
+        st.metric("Successful", f"{successful} ({100*successful/total:.1f}%)" if total > 0 else "N/A")
+
+    with col3:
+        psbt_gen = int(truthy_series(results_df['psbt_generated']).sum()) if 'psbt_generated' in results_df.columns else 0
+        st.metric("PSBTs Generated", f"{psbt_gen} ({100*psbt_gen/total:.1f}%)" if total > 0 else "N/A")
+
+    avg_score = pd.to_numeric(results_df['privacy_score'], errors='coerce').mean() if 'privacy_score' in results_df.columns else None
+    with col4:
+        st.metric("Avg Privacy Score", f"{avg_score:.1f}" if pd.notna(avg_score) else "N/A")
+
+    avg_time = pd.to_numeric(results_df['execution_time_seconds'], errors='coerce').mean() if 'execution_time_seconds' in results_df.columns else None
+    with col5:
+        st.metric("Avg Execution Time", f"{avg_time:.1f}s" if pd.notna(avg_time) else "N/A")
+
+    st.divider()
+
+    # Detailed results table
+    st.subheader("Detailed Results")
+
+    # Apply filters
+    col1, col2, col3, col4 = st.columns(4)
+
+    with col1:
+        providers = sorted(results_df['llm_provider'].dropna().astype(str).unique()) if 'llm_provider' in results_df.columns else []
+        filter_provider = st.multiselect("Provider", providers, default=[])
+
+    with col2:
+        models = sorted(results_df['llm_model'].dropna().astype(str).unique()) if 'llm_model' in results_df.columns else []
+        filter_model = st.multiselect("Model", models, default=[])
+
+    with col3:
+        success_filter = st.selectbox("Status", ["All", "Success Only", "Failures Only"])
+
+    with col4:
+        sanity_values = sorted(v for v in results_df.get('sanity_status', pd.Series(dtype=str)).dropna().unique() if str(v))
+        sanity_filter = st.multiselect("Sanity", sanity_values, default=[])
+
+    # Filter
+    filtered_df = results_df
+    if filter_provider:
+        filtered_df = filtered_df[filtered_df['llm_provider'].isin(filter_provider)]
+    if filter_model:
+        filtered_df = filtered_df[filtered_df['llm_model'].isin(filter_model)]
+
+    if success_filter == "Success Only":
+        filtered_df = filtered_df[truthy_series(filtered_df['success'])]
+    elif success_filter == "Failures Only":
+        filtered_df = filtered_df[~truthy_series(filtered_df['success'])]
+    if sanity_filter and 'sanity_status' in filtered_df.columns:
+        filtered_df = filtered_df[filtered_df['sanity_status'].isin(sanity_filter)]
+
+    show_dataframe(filtered_df[display_columns(filtered_df.columns)], width='stretch')
+
+    # Charts
+    st.subheader("Charts")
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        if 'privacy_score' in results_df.columns and 'llm_model' in results_df.columns:
+            st.subheader("Average Privacy Score by Model")
+            chart_df = results_df.copy()
+            chart_df['privacy_score'] = pd.to_numeric(chart_df['privacy_score'], errors='coerce')
+            score_by_model = chart_df.dropna(subset=['privacy_score']).groupby('llm_model')['privacy_score'].mean().sort_values(ascending=False)
+            st.bar_chart(score_by_model)
+
+    with col2:
+        if 'privacy_grade' in results_df.columns:
+            st.subheader("Privacy Grade Distribution")
+            grade_counts = results_df['privacy_grade'].value_counts()
+            st.bar_chart(grade_counts)
+
+    st.divider()
+    show_paper_chart_gallery(results_df, key_prefix="results_paper")
+
+
+def show_compare_results(manager: ExperimentManager):
+    """Compare results across experiments."""
+    st.title("🔍 Compare Results")
+
+    result_files = load_result_files()
+    if not result_files:
+        st.info("No results yet.")
+        return
+
+    results_df, selected_files = choose_results_dataframe(
+        manager,
+        key_prefix="compare",
+        default_scope="All result files",
+    )
+    if results_df is None or results_df.empty:
+        st.info("No rows found in the selected result files.")
+        return
+
+    st.caption(f"Comparing {len(results_df)} rows from {len(selected_files)} result file(s).")
+
+    comparison_type = st.selectbox(
+        "Compare by",
+        ["Model", "Strategy", "Provider", "Amount (BTC)"]
+    )
+
+    if comparison_type == "Model" and 'llm_model' in results_df.columns:
+        by_col = 'llm_model'
+    elif comparison_type == "Strategy" and 'strategy' in results_df.columns:
+        by_col = 'strategy'
+    elif comparison_type == "Provider" and 'llm_provider' in results_df.columns:
+        by_col = 'llm_provider'
+    elif comparison_type == "Amount (BTC)" and 'amount_btc' in results_df.columns:
+        by_col = 'amount_btc'
+    else:
+        st.warning("Comparison not available for this dimension")
+        return
+
+    # Group and aggregate
+    chart_df = results_df.copy()
+    chart_df['privacy_score'] = pd.to_numeric(chart_df['privacy_score'], errors='coerce')
+    chart_df['execution_time_seconds'] = pd.to_numeric(chart_df['execution_time_seconds'], errors='coerce')
+    chart_df['success_rate'] = truthy_series(chart_df['success']).astype(float)
+    grouped = chart_df.dropna(subset=['privacy_score']).groupby(by_col).agg({
+        'privacy_score': ['mean', 'std', 'min', 'max', 'count'],
+        'success_rate': 'mean',
+        'execution_time_seconds': 'mean',
+    }).round(2)
+
+    st.subheader(f"Comparison by {comparison_type}")
+    show_dataframe(grouped, width='stretch')
+
+    # Visualization
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.subheader(f"Average Privacy Score by {comparison_type}")
+        by_stats = chart_df.dropna(subset=['privacy_score']).groupby(by_col)['privacy_score'].mean().sort_values(ascending=False)
+        st.bar_chart(by_stats)
+
+    with col2:
+        st.subheader(f"Success Rate (%) by {comparison_type}")
+        by_success = chart_df.groupby(by_col)['success_rate'].mean() * 100
+        st.bar_chart(by_success)
+
+    st.divider()
+    show_paper_chart_gallery(results_df, key_prefix="compare_paper")
+
+
+if __name__ == "__main__":
+    main()

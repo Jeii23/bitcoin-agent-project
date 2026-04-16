@@ -43,7 +43,7 @@ from decimal import Decimal
 # Add source paths
 SCRIPT_DIR = Path(__file__).resolve().parent
 SRC_DIR = SCRIPT_DIR.parent / "src"
-SCORING_DIR = SCRIPT_DIR.parent.parent / "scoring"
+SCORING_DIR = SCRIPT_DIR.parent.parent / "analysis" / "scoring"
 PROJECT_DIR = SCRIPT_DIR.parent
 
 sys.path.insert(0, str(SRC_DIR))
@@ -598,10 +598,21 @@ class ExperimentRunner:
                 "psbt_generated",
                 "privacy_score",
                 "privacy_grade",
+                "psbt_file",
+                "fee_sanity_ok",
+                "sanity_status",
+                "fee_rate_sat_vb",
+                "fee_sats",
                 "tags",
             ])
             # Data rows
             for r in self.results:
+                privacy_breakdown = r.privacy_breakdown or {}
+                fee_analysis = privacy_breakdown.get("fee_analysis") or {}
+                fee_sanity_ok = privacy_breakdown.get("fee_sanity_ok", "")
+                sanity_status = privacy_breakdown.get("sanity_status", "")
+                fee_rate = fee_analysis.get("fee_rate_sat_vb", "")
+                fee_sats = fee_analysis.get("fee_sats", "")
                 writer.writerow([
                     r.experiment_id,
                     r.experiment_name,
@@ -615,8 +626,13 @@ class ExperimentRunner:
                     r.error_message or "",
                     f"{r.execution_time_seconds:.2f}",
                     r.psbt_generated,
-                    r.privacy_score or "",
+                    r.privacy_score if r.privacy_score is not None else "",
                     r.privacy_grade or "",
+                    r.psbt_file or "",
+                    fee_sanity_ok,
+                    sanity_status,
+                    fee_rate,
+                    fee_sats,
                     ";".join(r.tags),
                 ])
         logger.info(f"Summary CSV saved to: {csv_path}")
@@ -675,9 +691,10 @@ def create_filter(filter_str: str):
     """Create a filter function from a filter string.
     
     Formats:
-        tag:privacy-high  - Filter by tag
-        provider:openai   - Filter by provider
-        model:gpt-4o      - Filter by model
+        tag:privacy-high                     - Filter by tag
+        provider:openai                      - Filter by provider
+        model:gpt-4o                         - Filter by model
+        ids:exp_openai_basic,exp_google_basic - Filter by multiple exact IDs
     """
     if not filter_str:
         return None
@@ -697,6 +714,14 @@ def create_filter(filter_str: str):
         return lambda e: filter_value in e.llm.model.lower()
     elif filter_type == "id":
         return lambda e: e.id.lower() == filter_value
+    elif filter_type == "ids":
+        import re
+        wanted_ids = {
+            item.strip().lower()
+            for item in re.split(r"[,|]", filter_value)
+            if item.strip()
+        }
+        return lambda e: e.id.lower() in wanted_ids
     elif filter_type == "name":
         return lambda e: filter_value in e.name.lower()
     else:
@@ -728,6 +753,9 @@ Examples:
     
     # Run a specific experiment by ID
     python experiment_runner.py experiments.csv --filter id:exp_openai_basic
+
+    # Run several selected experiments in a single result file
+    python experiment_runner.py experiments.csv --filter ids:exp_openai_basic,exp_google_basic
     
     # Dry run (parse and validate without executing)
     python experiment_runner.py experiments.csv --dry-run
@@ -737,7 +765,7 @@ Examples:
         """
     )
     parser.add_argument("input_file", type=Path, help="Path to experiments CSV file")
-    parser.add_argument("--filter", type=str, help="Filter experiments (e.g., tag:privacy-high, provider:openai, id:exp_001)")
+    parser.add_argument("--filter", type=str, help="Filter experiments (e.g., tag:privacy-high, provider:openai, id:exp_001, ids:exp_001,exp_002)")
     parser.add_argument("--experiment", type=str, help="Run only a specific experiment by ID (shortcut for --filter id:...)")
     parser.add_argument("--output", type=Path, default=Path("results"), help="Output directory for results")
     parser.add_argument("--dry-run", action="store_true", help="Parse and validate without executing")
