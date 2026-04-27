@@ -94,26 +94,41 @@ python experiment_runner.py experiments.csv --dry-run
 python experiment_runner.py experiments.csv
 
 # Run a single experiment
-python experiment_runner.py experiments.csv --filter id:exp_openai_basic
+python experiment_runner.py experiments.csv --filter id:exp_openai_gpt54_basic_pct10_t03
 
 # Run several selected experiments into one result file
-python experiment_runner.py experiments.csv --filter ids:exp_openai_basic,exp_google_basic
+python experiment_runner.py experiments.csv --filter ids:exp_openai_gpt54_basic_pct10_t03,exp_openrouter_gemini31pro_basic_pct10_t03
 
 # Filter by provider, model, tag, or name
 python experiment_runner.py experiments.csv --filter provider:openai
-python experiment_runner.py experiments.csv --filter model:gpt-5.2
-python experiment_runner.py experiments.csv --filter tag:privacy-simple
+python experiment_runner.py experiments.csv --filter model:gpt-5.4
+python experiment_runner.py experiments.csv --filter tag:prompt-privacy-simple
 python experiment_runner.py experiments.csv --filter name:basic
 
 # Reduce rate-limit pressure
 python experiment_runner.py experiments.csv --interleave --delay 3
+
+# Run provider lanes concurrently
+python experiment_runner.py experiments.csv \
+  --parallel-profile provider \
+  --max-concurrency 3 \
+  --provider-limits openai=1,anthropic=1,openrouter=1
+
+# Aggressive current-batch profile: one lane per model, up to 3 OpenRouter lanes
+python experiment_runner.py experiments.csv \
+  --parallel-profile model \
+  --max-concurrency 5 \
+  --provider-limits openai=1,anthropic=1,openrouter=3 \
+  --model-limit 1
 ```
 
 Use `--verbose` when debugging:
 
 ```bash
-python experiment_runner.py experiments.csv --filter id:exp_openai_basic --verbose
+python experiment_runner.py experiments.csv --filter id:exp_openai_gpt54_basic_pct10_t03 --verbose
 ```
+
+The default remains sequential. `--parallel-profile provider` and `--parallel-profile model` are opt-in local batch modes; they do not change the agent security model, and the agent still never signs or broadcasts. Keep limits conservative if you see 429/503/529 responses, especially on OpenRouter where upstream providers can throttle independently.
 
 ## Running the Local Web UI
 
@@ -131,6 +146,8 @@ Main UI capabilities:
 - control provider, model, temperature, repetitions, timeout, network, tags, and enabled state,
 - generate prompts from amount + strategy or preserve fully custom prompts,
 - run selected experiments through the CLI runner,
+- choose sequential, provider-lane, or model-lane execution,
+- monitor any active `experiment_runner.py` batch from the Results page, including terminal-launched runs,
 - inspect result tables, scores, fee sanity, PSBT paths, and comparison charts.
 
 The UI is optional. Any experiment created by the UI is still represented as a CSV row and can be run from the CLI.
@@ -247,7 +264,7 @@ results/experiments_YYYYMMDD_HHMMSS.csv
 results/experiments_YYYYMMDD_HHMMSS.json
 ```
 
-The runner creates that pair for the batch and rewrites it incrementally after each completed run, so the Streamlit Results view can inspect a live batch while it is still executing. The CSV is the compact summary. The JSON keeps detailed scorer breakdowns, agent responses, and PSBT metadata when available. Binary and Base64 PSBTs are saved under:
+The runner creates that pair for the batch and rewrites it incrementally after each completed run, so the Streamlit Results view can inspect a live batch while it is still executing. The Results page also detects active `experiment_runner.py` processes, reconstructs the expected run count from the command's CSV/filter when possible, and auto-refreshes a live progress panel. The CSV is the compact summary. The JSON keeps detailed scorer breakdowns, agent responses, and PSBT metadata when available. Binary and Base64 PSBTs are saved under:
 
 ```text
 results/psbts/
@@ -268,10 +285,11 @@ python experiment_runner.py experiments.csv --dry-run --filter id:exp_openrouter
 
 # Syntax check
 cd ..
-python -m py_compile experiments/*.py
+python -m py_compile experiments/*.py src/bitcoin_ai_agent.py
 
 # UI/helper tests
 pytest -q tests/test_experiment_web_integration.py
+pytest -q tests/test_llm_factory_compatibility.py
 ```
 
 The dry-run does not call LLM APIs. Running real experiments may use API credits and can take several minutes per experiment.
@@ -280,7 +298,8 @@ Before launching the full Phase 1 batch, the intended workflow is:
 
 1. Dry-run one representative row per provider lane.
 2. Run one paid smoke test per selected model, preferably the `basic`, `10%`, `T0.3` row.
-3. Only then launch the full enabled Phase 1 screening matrix.
+3. Run a small provider-lane smoke batch with `--parallel-profile provider`.
+4. Only then launch the full enabled Phase 1 screening matrix with model lanes if provider limits look healthy.
 
 ## Research Notes
 

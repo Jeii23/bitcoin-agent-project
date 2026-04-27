@@ -15,8 +15,12 @@ import subprocess
 import logging
 import sys
 import re
+import os
+import shlex
+import time
+from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Dict, Optional
+from typing import Any, List, Dict, Optional, Tuple
 
 # Make local helper imports robust whether Streamlit is launched from
 # experiments/ or from the project root/testing harness.
@@ -77,6 +81,32 @@ def show_pdf_preview(pdf_path: Path, *, height: int = 720):
 _RESULT_FILE_RE = re.compile(r"experiments_(\d{8}_\d{6})\.csv$")
 
 
+@dataclass
+class RunnerCommandInfo:
+    pid: Optional[int]
+    elapsed_seconds: int
+    command: str
+    input_file: Optional[Path]
+    output_dir: Path
+    filter_expr: Optional[str] = None
+    experiment_id: Optional[str] = None
+    dry_run: bool = False
+
+
+@dataclass
+class LiveExecutionStatus:
+    command_info: RunnerCommandInfo
+    expected_runs: Optional[int]
+    result_file: Optional[Path]
+    completed_runs: int
+    successful_runs: int
+    psbt_runs: int
+    failed_runs: int
+    last_timestamp: Optional[str]
+    last_experiment_id: Optional[str]
+    last_model: Optional[str]
+
+
 def load_css():
     """Load custom CSS for better styling."""
     st.markdown("""
@@ -102,7 +132,21 @@ def option_index(options: List[str], value: str, default: int = 0) -> int:
 def truthy_series(series: pd.Series) -> pd.Series:
     """Normalize CSV bool values that may arrive as bools or strings."""
     values = series.astype("object").where(series.notna(), "")
-    return values.astype(str).str.lower().isin({"true", "1", "yes", "y"})
+    return values.astype(str).str.lower().isin({"true", "1", "1.0", "yes", "y"})
+
+
+def format_duration(seconds: Optional[int]) -> str:
+    """Format a duration compactly for live status displays."""
+    if seconds is None:
+        return "unknown"
+    seconds = max(0, int(seconds))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h {minutes:02d}m {secs:02d}s"
+    if minutes:
+        return f"{minutes}m {secs:02d}s"
+    return f"{secs}s"
 
 
 def split_filter_values(value: str) -> List[str]:
@@ -273,6 +317,10 @@ def build_runner_command(
     interleave: bool = False,
     delay: float = 0,
     dry_run: bool = False,
+    parallel_profile: str = "sequential",
+    max_concurrency: Optional[int] = None,
+    provider_limits: str = "",
+    model_limit: Optional[int] = None,
 ) -> List[str]:
     """Build the CLI command the UI will execute."""
     cmd = [
@@ -288,9 +336,51 @@ def build_runner_command(
         cmd.append("--interleave")
     if delay > 0:
         cmd.extend(["--delay", str(delay)])
+    if parallel_profile and parallel_profile != "sequential":
+        cmd.extend(["--parallel-profile", parallel_profile])
+    if max_concurrency and (parallel_profile != "sequential" or int(max_concurrency) != 1):
+        cmd.extend(["--max-concurrency", str(max_concurrency)])
+    if provider_limits.strip():
+        cmd.extend(["--provider-limits", provider_limits.strip()])
+    if model_limit and parallel_profile == "model":
+        cmd.extend(["--model-limit", str(model_limit)])
     if dry_run:
         cmd.append("--dry-run")
     return cmd
+
+
+def estimate_runner_timeout_seconds(
+    selected_meta: List[ExperimentMeta],
+    *,
+    parallel_profile: str = "sequential",
+    max_concurrency: int = 1,
+    model_limit: int = 1,
+    delay: float = 0,
+) -> int:
+    """Estimate subprocess timeout with a conservative concurrency-aware upper bound."""
+    task_costs = [meta.timeout_seconds for meta in selected_meta for _ in range(meta.repetitions)]
+    if not task_costs:
+        return 120
+
+    sequential_seconds = sum(task_costs)
+    if parallel_profile == "sequential":
+        estimate = sequential_seconds
+    elif parallel_profile == "provider":
+        by_provider: Dict[str, int] = {}
+        for meta in selected_meta:
+            by_provider[meta.provider] = by_provider.get(meta.provider, 0) + meta.timeout_seconds * meta.repetitions
+        estimate = max(by_provider.values()) if by_provider else sequential_seconds
+    else:
+        by_model: Dict[Tuple[str, str], int] = {}
+        for meta in selected_meta:
+            key = (meta.provider, meta.model)
+            by_model[key] = by_model.get(key, 0) + meta.timeout_seconds * meta.repetitions
+        lane_bound = max(by_model.values()) if by_model else sequential_seconds
+        throughput_bound = sequential_seconds / max(1, max_concurrency)
+        estimate = max(lane_bound / max(1, model_limit), throughput_bound)
+
+    estimate += delay * max(0, len(task_costs) - 1)
+    return int(estimate + max(120, 0.15 * estimate))
 
 
 def run_runner_command(cmd: List[str], timeout_seconds: Optional[int] = None) -> subprocess.CompletedProcess:
@@ -302,6 +392,215 @@ def run_runner_command(cmd: List[str], timeout_seconds: Optional[int] = None) ->
         cwd=SCRIPT_DIR,
         timeout=timeout_seconds,
     )
+
+
+def _resolve_process_path(value: Optional[str], cwd: Path) -> Optional[Path]:
+    if not value:
+        return None
+    path = Path(value).expanduser()
+    if path.is_absolute():
+        return path
+    return (cwd / path).resolve()
+
+
+def _process_cwd(pid: Optional[int]) -> Path:
+    if not pid:
+        return SCRIPT_DIR
+    try:
+        return Path(os.readlink(f"/proc/{pid}/cwd"))
+    except OSError:
+        return SCRIPT_DIR
+
+
+def parse_runner_command_info(command: str, *, pid: Optional[int] = None, elapsed_seconds: int = 0) -> Optional[RunnerCommandInfo]:
+    """Extract runner CSV/output/filter details from a process command line."""
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return None
+
+    runner_idx = None
+    for idx, token in enumerate(tokens):
+        if Path(token).name == "experiment_runner.py":
+            runner_idx = idx
+            break
+    if runner_idx is None:
+        return None
+
+    cwd = _process_cwd(pid)
+    input_token = tokens[runner_idx + 1] if runner_idx + 1 < len(tokens) else None
+    if input_token and input_token.startswith("-"):
+        input_token = None
+
+    output_token = "results"
+    filter_expr = None
+    experiment_id = None
+    dry_run = False
+    idx = runner_idx + 2
+    while idx < len(tokens):
+        token = tokens[idx]
+        if token == "--output" and idx + 1 < len(tokens):
+            output_token = tokens[idx + 1]
+            idx += 2
+            continue
+        if token.startswith("--output="):
+            output_token = token.split("=", 1)[1]
+        elif token == "--filter" and idx + 1 < len(tokens):
+            filter_expr = tokens[idx + 1]
+            idx += 2
+            continue
+        elif token.startswith("--filter="):
+            filter_expr = token.split("=", 1)[1]
+        elif token == "--experiment" and idx + 1 < len(tokens):
+            experiment_id = tokens[idx + 1]
+            idx += 2
+            continue
+        elif token.startswith("--experiment="):
+            experiment_id = token.split("=", 1)[1]
+        elif token == "--dry-run":
+            dry_run = True
+        idx += 1
+
+    output_dir = _resolve_process_path(output_token, cwd) or (SCRIPT_DIR / "results")
+    return RunnerCommandInfo(
+        pid=pid,
+        elapsed_seconds=elapsed_seconds,
+        command=command,
+        input_file=_resolve_process_path(input_token, cwd),
+        output_dir=output_dir,
+        filter_expr=filter_expr,
+        experiment_id=experiment_id,
+        dry_run=dry_run,
+    )
+
+
+def find_running_runner_commands() -> List[RunnerCommandInfo]:
+    """Find active experiment_runner.py processes started from the local machine."""
+    try:
+        result = subprocess.run(
+            ["ps", "-eo", "pid=,etimes=,args="],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return []
+    if result.returncode != 0:
+        return []
+
+    commands: List[RunnerCommandInfo] = []
+    current_pid = os.getpid()
+    for line in result.stdout.splitlines():
+        parts = line.strip().split(None, 2)
+        if len(parts) != 3:
+            continue
+        pid_text, elapsed_text, command = parts
+        if "experiment_runner.py" not in command:
+            continue
+        try:
+            pid = int(pid_text)
+            elapsed = int(elapsed_text)
+        except ValueError:
+            continue
+        if pid == current_pid:
+            continue
+        info = parse_runner_command_info(command, pid=pid, elapsed_seconds=elapsed)
+        if info is not None:
+            commands.append(info)
+    return commands
+
+
+def expected_runs_for_command(info: RunnerCommandInfo) -> Optional[int]:
+    """Reconstruct planned repetitions for a live runner command when possible."""
+    if info.input_file is None or not info.input_file.exists() or info.dry_run:
+        return None
+    try:
+        from experiment_runner import ExperimentCSVParser, create_filter
+
+        experiments = ExperimentCSVParser(info.input_file).parse()
+        active = [exp for exp in experiments if exp.enabled]
+        if info.experiment_id:
+            active = [exp for exp in active if exp.id == info.experiment_id]
+        elif info.filter_expr:
+            filter_fn = create_filter(info.filter_expr)
+            if filter_fn:
+                active = [exp for exp in active if filter_fn(exp)]
+        return sum(exp.settings.repetitions for exp in active)
+    except Exception as exc:
+        logger.debug("Could not reconstruct runner task count: %s", exc)
+        return None
+
+
+def latest_result_file_in(output_dir: Path) -> Optional[Path]:
+    """Return the newest runner CSV directly under an output directory."""
+    if not output_dir.exists():
+        return None
+    files = [path for path in output_dir.glob("experiments_*.csv") if path.is_file()]
+    if not files:
+        return None
+    return max(files, key=lambda path: path.stat().st_mtime)
+
+
+def summarize_result_file(csv_path: Optional[Path]) -> Dict[str, Any]:
+    """Summarize a runner CSV that may still be growing."""
+    empty = {
+        "completed_runs": 0,
+        "successful_runs": 0,
+        "psbt_runs": 0,
+        "failed_runs": 0,
+        "last_timestamp": None,
+        "last_experiment_id": None,
+        "last_model": None,
+    }
+    if csv_path is None or not csv_path.exists():
+        return empty
+    try:
+        df = pd.read_csv(csv_path)
+    except (pd.errors.EmptyDataError, OSError):
+        return empty
+    if df.empty:
+        return empty
+
+    success = int(truthy_series(df["success"]).sum()) if "success" in df.columns else 0
+    psbts = int(truthy_series(df["psbt_generated"]).sum()) if "psbt_generated" in df.columns else 0
+    failed = int((~truthy_series(df["success"])).sum()) if "success" in df.columns else 0
+
+    recent = df.iloc[-1]
+    if "timestamp" in df.columns:
+        parsed = pd.to_datetime(df["timestamp"], errors="coerce")
+        if parsed.notna().any():
+            recent = df.loc[parsed.idxmax()]
+
+    return {
+        "completed_runs": len(df),
+        "successful_runs": success,
+        "psbt_runs": psbts,
+        "failed_runs": failed,
+        "last_timestamp": str(recent.get("timestamp", "")) or None,
+        "last_experiment_id": str(recent.get("experiment_id", "")) or None,
+        "last_model": str(recent.get("llm_model", "")) or None,
+    }
+
+
+def discover_live_execution_statuses() -> List[LiveExecutionStatus]:
+    """Build live status rows for every active runner process."""
+    statuses: List[LiveExecutionStatus] = []
+    for info in find_running_runner_commands():
+        result_file = latest_result_file_in(info.output_dir)
+        summary = summarize_result_file(result_file)
+        statuses.append(LiveExecutionStatus(
+            command_info=info,
+            expected_runs=expected_runs_for_command(info),
+            result_file=result_file,
+            completed_runs=summary["completed_runs"],
+            successful_runs=summary["successful_runs"],
+            psbt_runs=summary["psbt_runs"],
+            failed_runs=summary["failed_runs"],
+            last_timestamp=summary["last_timestamp"],
+            last_experiment_id=summary["last_experiment_id"],
+            last_model=summary["last_model"],
+        ))
+    return statuses
 
 
 def load_result_files() -> List[Path]:
@@ -378,6 +677,67 @@ def choose_results_dataframe(
 
     results_df = load_many_results_dataframes(selected_files, manager=manager)
     return results_df, selected_files
+
+
+@st.fragment(run_every="10s")
+def show_live_execution_monitor():
+    """Display live runner progress, including terminal-launched batches."""
+    st.subheader("Live Execution")
+    statuses = discover_live_execution_statuses()
+
+    if statuses:
+        st.caption("Auto-refreshes every 10 seconds while this tab is open.")
+        for status in statuses:
+            info = status.command_info
+            label = f"PID {info.pid} running for {format_duration(info.elapsed_seconds)}"
+            with st.container(border=True):
+                st.write(f"**{label}**")
+                if info.input_file:
+                    st.caption(f"Input: `{info.input_file}`")
+                st.caption(f"Output: `{info.output_dir}`")
+
+                if status.expected_runs:
+                    ratio = min(status.completed_runs / status.expected_runs, 1.0)
+                    st.progress(
+                        ratio,
+                        text=f"{status.completed_runs}/{status.expected_runs} runs completed ({ratio * 100:.1f}%)",
+                    )
+                else:
+                    st.progress(0.0, text=f"{status.completed_runs} runs completed")
+
+                col1, col2, col3, col4 = st.columns(4)
+                col1.metric("Completed", status.completed_runs)
+                col2.metric("Successful", status.successful_runs)
+                col3.metric("PSBTs", status.psbt_runs)
+                col4.metric("Failures", status.failed_runs)
+
+                if status.last_experiment_id:
+                    st.caption(
+                        f"Last completed: `{status.last_experiment_id}`"
+                        f"{f' / `{status.last_model}`' if status.last_model else ''}"
+                        f"{f' at {status.last_timestamp}' if status.last_timestamp else ''}"
+                    )
+                if status.result_file:
+                    st.caption(f"Live CSV: `{format_result_path(status.result_file)}`")
+                else:
+                    st.caption("Waiting for the runner to create its first result CSV.")
+        return
+
+    latest = load_result_files()[-1] if load_result_files() else None
+    if latest:
+        summary = summarize_result_file(latest)
+        try:
+            age_seconds = int(time.time() - latest.stat().st_mtime)
+        except OSError:
+            age_seconds = None
+        st.info(
+            "No active experiment_runner process detected. "
+            f"Latest result file appears idle: `{format_result_path(latest)}` "
+            f"with {summary['completed_runs']} rows"
+            f"{f', last updated {format_duration(age_seconds)} ago' if age_seconds is not None else ''}."
+        )
+    else:
+        st.info("No active experiment_runner process detected and no result files found yet.")
 
 
 def show_paper_chart_gallery(
@@ -1065,16 +1425,50 @@ def show_run_experiments(manager: ExperimentManager):
 
     st.divider()
 
-    col1, col2, col3 = st.columns(3)
+    col1, col2, col3, col4 = st.columns(4)
 
     with col1:
-        interleave = st.checkbox("Interleave by provider", help="Run experiments in round-robin order to avoid rate limits")
+        parallel_label = st.selectbox(
+            "Execution profile",
+            ["Sequential", "Provider lanes", "Model lanes"],
+            help="Provider/model lanes run experiments concurrently with CLI safety limits.",
+        )
+        parallel_profile = {
+            "Sequential": "sequential",
+            "Provider lanes": "provider",
+            "Model lanes": "model",
+        }[parallel_label]
 
     with col2:
-        delay = st.number_input("Delay between experiments (sec)", min_value=0, value=0, step=1)
+        max_concurrency = st.number_input(
+            "Max concurrency",
+            min_value=1,
+            value=1 if parallel_profile == "sequential" else 5,
+            step=1,
+        )
 
     with col3:
+        provider_limits = st.text_input(
+            "Provider limits",
+            value="openai=1,anthropic=1,openrouter=3" if parallel_profile == "model" else "",
+            help="Comma-separated provider=N limits. OpenRouter may still be throttled by upstream providers.",
+        )
+
+    with col4:
+        model_limit = st.number_input("Model lane limit", min_value=1, value=1, step=1)
+
+    col5, col6, col7 = st.columns(3)
+    with col5:
+        interleave = st.checkbox("Interleave by provider", help="Round-robin ordering; useful for sequential runs and readable logs")
+
+    with col6:
+        delay = st.number_input("Delay between starts (sec)", min_value=0, value=0, step=1)
+
+    with col7:
         dry_run = st.checkbox("Dry run", help="Parse without executing")
+
+    if parallel_profile != "sequential":
+        st.caption("Parallel runs are local batch execution only: the agent remains xpub-only and does not sign or broadcast.")
 
     if st.button("▶️ Start Running", type="primary"):
         if not selected_ids:
@@ -1085,14 +1479,26 @@ def show_run_experiments(manager: ExperimentManager):
 
         selected_experiments = [e for e in experiments if e.get('id') in selected_ids]
         selected_meta = [manager.parse_csv_row_to_meta(e) for e in selected_experiments]
-        estimated_timeout = int(
-            sum(meta.timeout_seconds * meta.repetitions for meta in selected_meta)
-            + max(60, delay * max(0, len(selected_ids) - 1) + 60)
+        estimated_timeout = estimate_runner_timeout_seconds(
+            selected_meta,
+            parallel_profile=parallel_profile,
+            max_concurrency=int(max_concurrency),
+            model_limit=int(model_limit),
+            delay=delay,
         )
         if dry_run:
             estimated_timeout = 120
 
-        cmd = build_runner_command(selected_ids, interleave=interleave, delay=delay, dry_run=dry_run)
+        cmd = build_runner_command(
+            selected_ids,
+            interleave=interleave,
+            delay=delay,
+            dry_run=dry_run,
+            parallel_profile=parallel_profile,
+            max_concurrency=int(max_concurrency),
+            provider_limits=provider_limits,
+            model_limit=int(model_limit),
+        )
         st.code(" ".join(cmd), language="bash")
 
         with st.spinner("Running dry-run..." if dry_run else "Running selected experiments..."):
@@ -1120,6 +1526,9 @@ def show_run_experiments(manager: ExperimentManager):
 def show_results(manager: ExperimentManager):
     """Visualize results."""
     st.title("📈 Experiment Results")
+
+    show_live_execution_monitor()
+    st.divider()
 
     result_files = load_result_files()
     if not result_files:

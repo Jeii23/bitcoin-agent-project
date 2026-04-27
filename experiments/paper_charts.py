@@ -64,12 +64,12 @@ PAPER_CHART_OPTIONS = [
 
 def _truthy_series(series: pd.Series) -> pd.Series:
     values = series.astype("object").where(series.notna(), "")
-    return values.astype(str).str.lower().isin({"true", "1", "yes", "y"})
+    return values.astype(str).str.lower().isin({"true", "1", "1.0", "yes", "y"})
 
 
 def _fee_ok_series(series: pd.Series) -> pd.Series:
     values = series.astype("object").where(series.notna(), "")
-    return values.astype(str).str.lower().isin({"true", "1", "yes"})
+    return values.astype(str).str.lower().isin({"true", "1", "1.0", "yes", "y"})
 
 
 def _series(df: pd.DataFrame, column: str, default: object = "") -> pd.Series:
@@ -85,7 +85,7 @@ def _has_columns(df: pd.DataFrame, columns: Iterable[str]) -> bool:
 
 def prompt_type_from_strategy(value: object) -> str:
     """Map UI strategy strings to the paper aggregation prompt_type naming."""
-    prompt = str(value or "").strip().lower().replace("-", "_")
+    prompt = _normalize_prompt_token(value)
     aliases = {
         "privacy_simple": "privacy_simple",
         "privacy_detailed": "privacy_detailed",
@@ -98,6 +98,54 @@ def prompt_type_from_strategy(value: object) -> str:
     return aliases.get(prompt, prompt or "unknown")
 
 
+def _normalize_prompt_token(value: object) -> str:
+    try:
+        if pd.isna(value):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    return str(value or "").strip().lower().replace("-", "_")
+
+
+def _known_prompt_type(value: object) -> Optional[str]:
+    prompt_type = prompt_type_from_strategy(value)
+    return prompt_type if prompt_type in PROMPT_LABELS else None
+
+
+def _tokens_from_row(row: pd.Series) -> List[str]:
+    values = []
+    for column in ("strategy", "prompt_type", "tags", "experiment_tags", "experiment_id", "experiment_name"):
+        if column in row.index:
+            values.append(row.get(column))
+    tokens: List[str] = []
+    for value in values:
+        if pd.isna(value):
+            continue
+        text = str(value).strip().lower()
+        for separator in (";", "|", ",", " "):
+            text = text.replace(separator, " ")
+        tokens.extend(part for part in text.split() if part)
+    return tokens
+
+
+def prompt_type_from_row(row: pd.Series) -> str:
+    """Infer prompt type from structured metadata, then tags used by temporary matrices."""
+    for column in ("strategy", "prompt_type"):
+        if column in row.index:
+            prompt_type = prompt_type_from_strategy(row.get(column))
+            if prompt_type != "unknown":
+                return prompt_type
+
+    for token in _tokens_from_row(row):
+        normalized = _normalize_prompt_token(token)
+        if normalized.startswith("prompt_"):
+            normalized = normalized.removeprefix("prompt_")
+        prompt_type = _known_prompt_type(normalized)
+        if prompt_type:
+            return prompt_type
+    return "unknown"
+
+
 def category_from_provider(provider: object) -> str:
     """Match the paper's open-source/closed-source split for current UI rows."""
     provider_text = str(provider or "").strip().lower()
@@ -106,6 +154,21 @@ def category_from_provider(provider: object) -> str:
     if provider_text:
         return "closed-source"
     return "unknown"
+
+
+def category_from_row(row: pd.Series) -> str:
+    """Infer open/closed category from tags when provider alone is ambiguous."""
+    tokens = {_normalize_prompt_token(token) for token in _tokens_from_row(row)}
+    model = str(row.get("llm_model", row.get("model_short", "")) or "").lower()
+    provider = row.get("llm_provider", row.get("provider", ""))
+
+    if tokens & {"open_weight", "open_source", "opensource"}:
+        return "open-source"
+    if any(marker in model for marker in ("glm", "gemma", "llama", "mistral", "qwen", "deepseek")):
+        return "open-source"
+    if tokens & {"frontier", "closed_source", "closed"}:
+        return "closed-source"
+    return category_from_provider(provider)
 
 
 def model_sort_order(models: Iterable[str]) -> List[str]:
@@ -195,8 +258,8 @@ def aggregate_current_results(results_df: pd.DataFrame) -> pd.DataFrame:
     df = results_df.copy()
     df["model_full"] = _series(df, "llm_model").astype(str)
     df["provider"] = _series(df, "llm_provider").astype(str)
-    df["category"] = df["provider"].map(category_from_provider)
-    df["prompt_type"] = _series(df, "strategy", "unknown").map(prompt_type_from_strategy)
+    df["category"] = df.apply(category_from_row, axis=1)
+    df["prompt_type"] = df.apply(prompt_type_from_row, axis=1)
     df["privacy_score_numeric"] = pd.to_numeric(_series(df, "privacy_score"), errors="coerce")
     df["execution_time_numeric"] = pd.to_numeric(_series(df, "execution_time_seconds"), errors="coerce")
     df["fee_rate_numeric"] = pd.to_numeric(_series(df, "fee_rate_sat_vb"), errors="coerce")
@@ -263,8 +326,8 @@ def current_results_v2_scores(results_df: pd.DataFrame) -> pd.DataFrame:
         fee_sanity = pd.Series([pd.NA] * len(df), index=df.index)
     return prepare_v2_scores_dataframe(pd.DataFrame({
         "model_short": _series(df, "llm_model"),
-        "category": _series(df, "llm_provider").map(category_from_provider),
-        "prompt_type": _series(df, "strategy", "unknown").map(prompt_type_from_strategy),
+        "category": df.apply(category_from_row, axis=1),
+        "prompt_type": df.apply(prompt_type_from_row, axis=1),
         "v2_overall_score": pd.to_numeric(_series(df, "privacy_score"), errors="coerce"),
         "fee_sanity_ok": fee_sanity,
         "fee_rate_sat_vb": pd.to_numeric(_series(df, "fee_rate_sat_vb"), errors="coerce"),

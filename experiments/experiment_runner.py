@@ -33,6 +33,8 @@ import csv
 import json
 import logging
 import os
+import random
+import re
 import sys
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
@@ -89,6 +91,18 @@ logger = logging.getLogger(__name__)
 # Silence noisy external loggers
 for _noisy in ("httpcore", "httpx", "openai", "anthropic", "urllib3", "langchain", "langgraph"):
     logging.getLogger(_noisy).setLevel(logging.WARNING)
+
+
+RETRYABLE_ERROR_MARKERS = (
+    "429",
+    "529",
+    "503",
+    "overloaded",
+    "rate_limit",
+    "rate limit",
+    "too many requests",
+    "unavailable",
+)
 
 
 # ==============================================================================
@@ -183,6 +197,15 @@ class ExperimentResult:
     tags: List[str] = field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class ExperimentTask:
+    """Single executable unit: one experiment repetition."""
+
+    order: int
+    experiment: Experiment
+    repetition: int
+
+
 # ==============================================================================
 # CSV Parser
 # ==============================================================================
@@ -270,6 +293,72 @@ class ExperimentCSVParser:
         )
 
 
+def parse_provider_limits(raw: str) -> Dict[str, int]:
+    """Parse provider concurrency limits like 'openai=1,openrouter=3'."""
+    limits: Dict[str, int] = {}
+    if not raw:
+        return limits
+
+    for part in re.split(r"[,;]", raw):
+        item = part.strip()
+        if not item:
+            continue
+        if "=" not in item:
+            raise ValueError(f"Invalid provider limit '{item}', expected provider=N")
+        provider, value = item.split("=", 1)
+        provider = provider.strip().lower()
+        try:
+            limit = int(value.strip())
+        except ValueError as exc:
+            raise ValueError(f"Invalid limit for provider '{provider}': {value}") from exc
+        if limit < 1:
+            raise ValueError(f"Provider limit for '{provider}' must be >= 1")
+        limits[provider] = limit
+    return limits
+
+
+def _is_retryable_error(exc: Exception) -> bool:
+    """Return True if an exception looks like a transient provider/API error."""
+    error_text = str(exc).lower()
+    return any(marker in error_text for marker in RETRYABLE_ERROR_MARKERS)
+
+
+def _retry_after_seconds(exc: Exception) -> Optional[float]:
+    """Extract retry-after from common SDK exception/header shapes when available."""
+    headers = None
+    response = getattr(exc, "response", None)
+    if response is not None:
+        headers = getattr(response, "headers", None)
+    if headers is None:
+        headers = getattr(exc, "headers", None)
+
+    if headers:
+        for key in ("retry-after", "Retry-After"):
+            try:
+                value = headers.get(key)
+            except Exception:
+                value = None
+            if value:
+                try:
+                    return max(0.0, float(value))
+                except ValueError:
+                    return None
+
+    match = re.search(r"retry-after[=:]\s*([0-9]+(?:\.[0-9]+)?)", str(exc), re.IGNORECASE)
+    if match:
+        return float(match.group(1))
+    return None
+
+
+def _retry_wait_seconds(exc: Exception, attempt: int) -> float:
+    """Compute bounded backoff with jitter, honoring retry-after when present."""
+    retry_after = _retry_after_seconds(exc)
+    if retry_after is not None:
+        return retry_after
+    base = min(120.0, (2 ** attempt) * 5.0)
+    return base + random.uniform(0.0, 1.0)
+
+
 # ==============================================================================
 # Experiment Runner
 # ==============================================================================
@@ -280,11 +369,13 @@ class ExperimentRunner:
     def __init__(self, output_dir: Path):
         self.output_dir = output_dir
         self.results: List[ExperimentResult] = []
+        self._results_by_order: Dict[int, ExperimentResult] = {}
         self._agent_class = None
         self._privacy_scorer_class = None
         self._run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self._json_path = self.output_dir / f"experiments_{self._run_timestamp}.json"
         self._csv_path = self.output_dir / f"experiments_{self._run_timestamp}.csv"
+        self._snapshot_lock = asyncio.Lock()
     
     def _lazy_import_agent(self):
         """Lazy import of BitcoinAIAgent to avoid import at module level."""
@@ -349,6 +440,7 @@ class ExperimentRunner:
                 llm_model=exp.llm.model,
                 api_key=api_key,
                 temperature=exp.llm.temperature,
+                write_latest_psbt_files=False,
             )
             
             # Configure wallet
@@ -383,10 +475,18 @@ class ExperimentRunner:
                 except Exception as e:
                     error_str = str(e)
                     # Check for retryable errors (rate limit, overloaded)
-                    if any(code in error_str for code in ['429', '529', '503', 'overloaded', 'rate_limit', 'UNAVAILABLE']):
+                    if _is_retryable_error(e):
                         retry_count += 1
                         if retry_count <= max_retries:
-                            wait_time = 2 ** retry_count * 5  # 10s, 20s, 40s
+                            wait_time = _retry_wait_seconds(e, retry_count)
+                            result.tool_trace = result.tool_trace or []
+                            result.tool_trace.append({
+                                "event": "retry",
+                                "scope": "main_prompt",
+                                "attempt": retry_count,
+                                "wait_seconds": round(wait_time, 2),
+                                "error": error_str[:500],
+                            })
                             logger.warning(f"  Retryable error, waiting {wait_time}s before retry {retry_count}/{max_retries}...")
                             await asyncio.sleep(wait_time)
                             continue
@@ -412,10 +512,18 @@ class ExperimentRunner:
                         break
                     except Exception as e:
                         error_str = str(e)
-                        if any(code in error_str for code in ['429', '529', '503', 'overloaded', 'rate_limit', 'UNAVAILABLE']):
+                        if _is_retryable_error(e):
                             followup_retry += 1
                             if followup_retry <= max_retries:
-                                wait_time = 2 ** followup_retry * 5
+                                wait_time = _retry_wait_seconds(e, followup_retry)
+                                result.tool_trace = result.tool_trace or []
+                                result.tool_trace.append({
+                                    "event": "retry",
+                                    "scope": "followup_prompt",
+                                    "attempt": followup_retry,
+                                    "wait_seconds": round(wait_time, 2),
+                                    "error": error_str[:500],
+                                })
                                 logger.warning(f"  Retryable error on followup, waiting {wait_time}s...")
                                 await asyncio.sleep(wait_time)
                                 continue
@@ -593,8 +701,83 @@ class ExperimentRunner:
             self._csv_path,
             len(self.results),
         )
+
+    async def _persist_results_snapshot_locked(self):
+        """Serialize concurrent snapshot rewrites."""
+        async with self._snapshot_lock:
+            self._persist_results_snapshot()
+
+    async def _record_result(self, order: int, result: ExperimentResult):
+        """Record a task result and persist rows in deterministic task order."""
+        async with self._snapshot_lock:
+            self._results_by_order[order] = result
+            self.results = [
+                self._results_by_order[idx]
+                for idx in sorted(self._results_by_order)
+            ]
+            self._persist_results_snapshot()
+
+    def _select_active_experiments(self, experiments: List[Experiment], filter_fn=None, interleave: bool = False) -> List[Experiment]:
+        """Filter, sort, and optionally interleave experiments before expanding repetitions."""
+        active_experiments = [e for e in experiments if e.enabled]
+
+        if filter_fn:
+            active_experiments = [e for e in active_experiments if filter_fn(e)]
+
+        active_experiments.sort(key=lambda e: e.priority)
+
+        if interleave:
+            active_experiments = self._interleave_by_provider(active_experiments)
+            logger.info("Interleaving experiments by provider (round-robin)")
+
+        return active_experiments
+
+    def _build_tasks(self, experiments: List[Experiment]) -> List[ExperimentTask]:
+        """Expand experiments into one task per repetition."""
+        tasks: List[ExperimentTask] = []
+        order = 0
+        for exp in experiments:
+            for rep in range(1, exp.settings.repetitions + 1):
+                tasks.append(ExperimentTask(order=order, experiment=exp, repetition=rep))
+                order += 1
+        return tasks
+
+    def _parallel_defaults(
+        self,
+        profile: str,
+        max_concurrency: Optional[int],
+        provider_limits: Optional[Dict[str, int]],
+        model_limit: Optional[int],
+    ) -> Tuple[int, Dict[str, int], Optional[int]]:
+        """Resolve concurrency defaults while keeping legacy CLI behavior sequential."""
+        profile = (profile or "sequential").lower()
+        provider_limits = dict(provider_limits or {})
+
+        if profile == "sequential":
+            return 1, provider_limits, None
+
+        if profile == "provider":
+            resolved_max = max_concurrency or 4
+            return resolved_max, provider_limits, None
+
+        if profile == "model":
+            resolved_max = max_concurrency or 5
+            resolved_model_limit = model_limit or 1
+            return resolved_max, provider_limits, resolved_model_limit
+
+        raise ValueError(f"Unknown parallel profile: {profile}")
     
-    async def run_all(self, experiments: List[Experiment], filter_fn=None, interleave: bool = False, delay: float = 0) -> List[ExperimentResult]:
+    async def run_all(
+        self,
+        experiments: List[Experiment],
+        filter_fn=None,
+        interleave: bool = False,
+        delay: float = 0,
+        parallel_profile: str = "sequential",
+        max_concurrency: Optional[int] = None,
+        provider_limits: Optional[Dict[str, int]] = None,
+        model_limit: Optional[int] = None,
+    ) -> List[ExperimentResult]:
         """Run all experiments.
         
         Args:
@@ -602,37 +785,101 @@ class ExperimentRunner:
             filter_fn: Optional filter function
             interleave: If True, interleave by provider (round-robin)
             delay: Delay in seconds between experiments
+            parallel_profile: sequential, provider, or model
+            max_concurrency: Maximum concurrent experiment repetitions
+            provider_limits: Optional per-provider concurrency limits
+            model_limit: Optional per-provider/model concurrency limit
         """
-        # Filter enabled experiments
-        active_experiments = [e for e in experiments if e.enabled]
-        
-        # Apply custom filter if provided
-        if filter_fn:
-            active_experiments = [e for e in active_experiments if filter_fn(e)]
-        
-        # Sort by priority
-        active_experiments.sort(key=lambda e: e.priority)
-        
-        # Interleave by provider if requested (round-robin)
-        if interleave:
-            active_experiments = self._interleave_by_provider(active_experiments)
-            logger.info("Interleaving experiments by provider (round-robin)")
-        
-        logger.info(f"Running {len(active_experiments)} experiments...")
+        active_experiments = self._select_active_experiments(experiments, filter_fn, interleave)
+        tasks = self._build_tasks(active_experiments)
+        resolved_max, resolved_provider_limits, resolved_model_limit = self._parallel_defaults(
+            parallel_profile,
+            max_concurrency,
+            provider_limits,
+            model_limit,
+        )
+        if parallel_profile == "provider" and not resolved_provider_limits:
+            resolved_provider_limits = {
+                exp.llm.provider.lower(): 1
+                for exp in active_experiments
+            }
+
+        logger.info(f"Running {len(active_experiments)} experiments ({len(tasks)} repetitions)...")
+        logger.info(
+            "Parallel profile=%s max_concurrency=%s provider_limits=%s model_limit=%s",
+            parallel_profile,
+            resolved_max,
+            resolved_provider_limits or "{}",
+            resolved_model_limit,
+        )
 
         # Create the run-scoped result files immediately so the web UI can
         # pick up an in-progress batch and then watch rows accumulate.
         self._persist_results_snapshot()
-        
-        for i, exp in enumerate(active_experiments):
-            for rep in range(1, exp.settings.repetitions + 1):
-                result = await self.run_experiment(exp, rep)
-                self.results.append(result)
-                self._persist_results_snapshot()
-                
-                # Add delay between experiments (helps with rate limits)
-                if delay > 0 and (i < len(active_experiments) - 1 or rep < exp.settings.repetitions):
+
+        if not tasks:
+            return self.results
+
+        if resolved_max <= 1:
+            for idx, task in enumerate(tasks):
+                result = await self.run_experiment(task.experiment, task.repetition)
+                await self._record_result(task.order, result)
+
+                if delay > 0 and idx < len(tasks) - 1:
                     await asyncio.sleep(delay)
+            return self.results
+
+        total_sem = asyncio.Semaphore(resolved_max)
+        provider_sems: Dict[str, asyncio.Semaphore] = {
+            provider: asyncio.Semaphore(limit)
+            for provider, limit in resolved_provider_limits.items()
+        }
+        model_sems: Dict[Tuple[str, str], asyncio.Semaphore] = {}
+        delay_lock = asyncio.Lock()
+        next_start_at = 0.0
+
+        async def _run_task(task: ExperimentTask):
+            nonlocal next_start_at
+            exp = task.experiment
+            provider = exp.llm.provider.lower()
+            model_key = (provider, exp.llm.model.lower())
+
+            provider_sem = provider_sems.get(provider)
+            if provider_sem is None:
+                provider_sem = asyncio.Semaphore(resolved_max)
+                provider_sems[provider] = provider_sem
+
+            async with provider_sem:
+                if resolved_model_limit:
+                    model_sem = model_sems.get(model_key)
+                    if model_sem is None:
+                        model_sem = asyncio.Semaphore(resolved_model_limit)
+                        model_sems[model_key] = model_sem
+                else:
+                    model_sem = None
+
+                async def _run_with_total_limit():
+                    nonlocal next_start_at
+                    async with total_sem:
+                        wait_for = 0.0
+                        if delay > 0:
+                            async with delay_lock:
+                                now = asyncio.get_running_loop().time()
+                                wait_for = max(0.0, next_start_at - now)
+                                next_start_at = max(now, next_start_at) + delay
+                        if wait_for:
+                            await asyncio.sleep(wait_for)
+                        return await self.run_experiment(exp, task.repetition)
+
+                if model_sem is not None:
+                    async with model_sem:
+                        result = await _run_with_total_limit()
+                else:
+                    result = await _run_with_total_limit()
+
+            await self._record_result(task.order, result)
+
+        await asyncio.gather(*(_run_task(task) for task in tasks))
         
         return self.results
     
@@ -801,6 +1048,20 @@ Examples:
     parser.add_argument("--dry-run", action="store_true", help="Parse and validate without executing")
     parser.add_argument("--interleave", action="store_true", help="Interleave experiments by provider (round-robin: openai, anthropic, google)")
     parser.add_argument("--delay", type=float, default=0, help="Delay in seconds between experiments (helps avoid rate limits)")
+    parser.add_argument(
+        "--parallel-profile",
+        choices=["sequential", "provider", "model"],
+        default="sequential",
+        help="Execution profile: sequential keeps legacy behavior; provider/model enable concurrent lanes",
+    )
+    parser.add_argument("--max-concurrency", type=int, help="Maximum concurrent experiment repetitions")
+    parser.add_argument(
+        "--provider-limits",
+        type=str,
+        default="",
+        help='Per-provider concurrency limits, e.g. "openai=1,anthropic=1,openrouter=3"',
+    )
+    parser.add_argument("--model-limit", type=int, help="Maximum concurrent repetitions per provider/model lane")
     parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose logging")
     
     args = parser.parse_args()
@@ -847,9 +1108,24 @@ Examples:
             print()
         sys.exit(0)
     
+    try:
+        provider_limits = parse_provider_limits(args.provider_limits)
+    except ValueError as exc:
+        logger.error(str(exc))
+        sys.exit(1)
+
     # Run experiments
     runner = ExperimentRunner(args.output)
-    asyncio.run(runner.run_all(experiments, filter_fn, interleave=args.interleave, delay=args.delay))
+    asyncio.run(runner.run_all(
+        experiments,
+        filter_fn,
+        interleave=args.interleave,
+        delay=args.delay,
+        parallel_profile=args.parallel_profile,
+        max_concurrency=args.max_concurrency,
+        provider_limits=provider_limits,
+        model_limit=args.model_limit,
+    ))
     
     # Save results
     runner.save_results()

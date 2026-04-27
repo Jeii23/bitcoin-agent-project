@@ -368,9 +368,7 @@ def get_available_providers() -> Dict[str, Dict]:
 
     # ============== HELPER ==============
 
-# Guarda l'últim missatge de l'usuari per poder corregir adreces mal parsejades pel LLM
-_LAST_USER_UTTERANCE: str = ""
-_LAST_RECIPIENT_ADDRESS: Optional[str] = None
+# No mantenim estat global de destinatari: els lots paral·lels han de ser aïllats.
 
 # Regex per candidates d'adreça (bech32 o base58 típiques)
 _ADDR_RE = re.compile(r"(bc1[0-9a-z]{8,}|tb1[0-9a-z]{8,}|[13][a-km-zA-HJ-NP-Z1-9]{25,})", re.IGNORECASE)
@@ -1532,9 +1530,7 @@ def create_transaction_manual(
         use_outputs_mode = bool(tx_opts and isinstance(tx_opts.get("outputs"), list))
         if not use_outputs_mode:
             if not recipient_address:
-                global _LAST_RECIPIENT_ADDRESS
-                if isinstance(_LAST_RECIPIENT_ADDRESS, str) and _LAST_RECIPIENT_ADDRESS:
-                    recipient_address = _LAST_RECIPIENT_ADDRESS
+                return {"success": False, "error": "recipient_address és obligatori en mode simple."}
             recipient_address = _normalize_address(recipient_address) or recipient_address
             PSBTCreator(network=network)._decode_address(recipient_address)  # valida
 
@@ -1707,6 +1703,7 @@ class BitcoinAIAgent:
         llm_model: str = None,
         api_key: str = None,
         temperature: float = 1.0,
+        write_latest_psbt_files: bool = True,
     ):
         """
         Initialize the Bitcoin AI Agent.
@@ -1718,6 +1715,7 @@ class BitcoinAIAgent:
             llm_model: Specific model name. Defaults to LLM_MODEL env var or provider's default.
             api_key: API key for the selected provider. Falls back to env vars.
             temperature: LLM temperature setting (default 1.0).
+            write_latest_psbt_files: Whether chat() writes psbt_latest.* convenience files.
 
         Environment variables:
             LLM_PROVIDER: Default provider ("openai", "anthropic", "google")
@@ -1790,6 +1788,7 @@ class BitcoinAIAgent:
         self.network = "testnet"
         self.last_psbt = None  # Guardar l'últim PSBT creat
         self.last_tool_trace: List[Dict[str, Any]] = []
+        self.write_latest_psbt_files = write_latest_psbt_files
     
     def _build_graph(self):
         """Construeix el graf de LangGraph"""
@@ -1896,8 +1895,7 @@ PROHIBIT:
                                 args = tc.get('args') or {}
                                 ra = args.get('recipient_address')
                                 if ra:
-                                    global _LAST_RECIPIENT_ADDRESS
-                                    _LAST_RECIPIENT_ADDRESS = _normalize_address(ra) or ra
+                                    args['recipient_address'] = _normalize_address(ra) or ra
                         except Exception:
                             pass
                 
@@ -1938,8 +1936,6 @@ PROHIBIT:
     
     async def chat(self, message: str) -> str:
         """Processa un missatge de l'usuari"""
-        global _LAST_USER_UTTERANCE
-        _LAST_USER_UTTERANCE = message
         self.last_tool_trace = []
         lower = message.lower().strip()
         # Heurística per detectar directiva (imperativa) i guardar-la
@@ -2088,18 +2084,22 @@ PROHIBIT:
                             else:
                                 # Assegura que qualsevol bloc anterior (multi-línia) al text es retirat
                                 final_response = _replace_psbt_in_text(final_response, clean_psbt)
-                                try:
-                                    # Write files for easy wallet import
-                                    Path("psbt_latest.psbt").write_bytes(base64.b64decode(clean_psbt))
-                                    Path("psbt_latest.base64").write_text(clean_psbt)
-                                except Exception as _e:
-                                    logger.warning("Could not write PSBT file: %s", _e)
+                                if self.write_latest_psbt_files:
+                                    try:
+                                        # Write files for easy wallet import
+                                        Path("psbt_latest.psbt").write_bytes(base64.b64decode(clean_psbt))
+                                        Path("psbt_latest.base64").write_text(clean_psbt)
+                                    except Exception as _e:
+                                        logger.warning("Could not write PSBT file: %s", _e)
 
                                 # Add standardized section with PSBT on its own line
                                 final_response += "\n\n📄 **PSBT creat en format BIP-174 estàndard**"
                                 final_response += "\nPots signar aquest PSBT amb qualsevol wallet compatible (Electrum, Bitcoin Core, hardware wallets, etc.)"
-                                final_response += "\nElectrum: usa Tools > Load transaction > From text i enganxa el PSBT en Base64, o File > Open/Load transaction > From file amb psbt_latest.psbt (no el peguis com a HEX)."
-                                final_response += "\nFitxers guardats: psbt_latest.psbt (binari) i psbt_latest.base64 (text)."
+                                if self.write_latest_psbt_files:
+                                    final_response += "\nElectrum: usa Tools > Load transaction > From text i enganxa el PSBT en Base64, o File > Open/Load transaction > From file amb psbt_latest.psbt (no el peguis com a HEX)."
+                                    final_response += "\nFitxers guardats: psbt_latest.psbt (binari) i psbt_latest.base64 (text)."
+                                else:
+                                    final_response += "\nElectrum: usa Tools > Load transaction > From text i enganxa el PSBT en Base64."
                                 final_response += "\n\nPSBT (Base64 una sola línia, sense salts):\n" + clean_psbt + "\n\n"
                                 # Defensive check for multiple PSBTs
                                 cnt = _count_psbt_blobs(final_response)

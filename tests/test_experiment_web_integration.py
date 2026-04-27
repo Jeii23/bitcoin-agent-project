@@ -1,6 +1,8 @@
 import csv
+import asyncio
 import json
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -14,7 +16,17 @@ if str(EXPERIMENTS_DIR) not in sys.path:
     sys.path.insert(0, str(EXPERIMENTS_DIR))
 
 from experiment_manager import ExperimentManager
-from experiment_runner import ExperimentResult, ExperimentRunner, create_filter
+from experiment_runner import (
+    Experiment,
+    ExperimentResult,
+    ExperimentRunner,
+    ExperimentSettings,
+    LLMConfig,
+    PromptConfig,
+    WalletConfig,
+    create_filter,
+    parse_provider_limits,
+)
 from paper_charts import (
     PAPER_CHART_OPTIONS,
     aggregate_current_results,
@@ -34,14 +46,33 @@ from result_utils import (
 from streamlit.testing.v1 import AppTest
 from web_ui import (
     all_tags_from_dataframe,
+    build_runner_command,
+    discover_live_execution_statuses,
+    estimate_runner_timeout_seconds,
     experiments_dataframe,
     filter_run_experiments,
     format_result_path,
+    parse_runner_command_info,
     load_result_files,
+    summarize_result_file,
     safe_prompt_mode,
     sort_results_for_display,
     split_filter_values,
 )
+
+
+def make_runner_experiment(exp_id: str, provider: str, model: str, timeout: int = 1) -> Experiment:
+    return Experiment(
+        id=exp_id,
+        name=exp_id,
+        description="",
+        llm=LLMConfig(provider=provider, model=model, temperature=0.3),
+        prompts=PromptConfig(user_prompt=f"prompt {exp_id}"),
+        wallet=WalletConfig(xpub="xpub-test", network="testnet"),
+        settings=ExperimentSettings(timeout_seconds=timeout, repetitions=1),
+        tags=[provider, model],
+        enabled=True,
+    )
 
 
 def test_legacy_csv_strategy_and_amount_inference():
@@ -77,7 +108,7 @@ def test_current_csv_2026_matrix_shape_and_model_selection():
     assert len(rows) == 180
     assert {row["provider"] for row in rows} == {"openai", "anthropic", "openrouter"}
     assert all(row["provider"] != "google" for row in rows)
-    assert sum(row["enabled"].lower() == "true" for row in rows) == 140
+    assert sum(row["enabled"].lower() == "true" for row in rows) == 100
     assert sum("phase-1" in row["tags"].split("|") for row in rows) == 140
     assert sum("phase-2" in row["tags"].split("|") for row in rows) == 40
     assert sum("prompt-basic" in row["tags"].split("|") for row in rows) == 70
@@ -313,6 +344,223 @@ def test_experiment_runner_updates_a_single_live_result_file(tmp_path):
     assert bool(updated_df.loc[1, "psbt_available"]) is False
 
 
+def test_experiment_runner_parallel_model_lanes_respect_limits_and_order(tmp_path, monkeypatch):
+    runner = ExperimentRunner(tmp_path)
+    experiments = [
+        make_runner_experiment("or_a", "openrouter", "model-a"),
+        make_runner_experiment("or_b", "openrouter", "model-a"),
+        make_runner_experiment("or_c", "openrouter", "model-b"),
+        make_runner_experiment("oa", "openai", "gpt-test"),
+    ]
+
+    active_total = 0
+    active_provider = {}
+    active_model = {}
+    max_total = 0
+    max_provider = {}
+    max_model = {}
+    lock = asyncio.Lock()
+
+    async def fake_run_experiment(exp, repetition=1, max_retries=3):
+        nonlocal active_total, max_total
+        provider = exp.llm.provider
+        model_key = (provider, exp.llm.model)
+        async with lock:
+            active_total += 1
+            active_provider[provider] = active_provider.get(provider, 0) + 1
+            active_model[model_key] = active_model.get(model_key, 0) + 1
+            max_total = max(max_total, active_total)
+            max_provider[provider] = max(max_provider.get(provider, 0), active_provider[provider])
+            max_model[model_key] = max(max_model.get(model_key, 0), active_model[model_key])
+
+        await asyncio.sleep(0.05)
+
+        async with lock:
+            active_total -= 1
+            active_provider[provider] -= 1
+            active_model[model_key] -= 1
+
+        return ExperimentResult(
+            experiment_id=exp.id,
+            experiment_name=exp.name,
+            repetition=repetition,
+            timestamp="2026-04-22 10:00:00",
+            llm_provider=provider,
+            llm_model=exp.llm.model,
+            llm_temperature=exp.llm.temperature,
+            system_prompt=None,
+            user_prompt=exp.prompts.user_prompt,
+            success=True,
+            error_message=None,
+            execution_time_seconds=0.05,
+            psbt_generated=False,
+            psbt_base64=None,
+            psbt_file=None,
+            privacy_score=None,
+            privacy_grade=None,
+            privacy_breakdown=None,
+            tags=exp.tags,
+        )
+
+    monkeypatch.setattr(runner, "run_experiment", fake_run_experiment)
+
+    started = time.perf_counter()
+    results = asyncio.run(runner.run_all(
+        experiments,
+        parallel_profile="model",
+        max_concurrency=3,
+        provider_limits={"openrouter": 2, "openai": 1},
+        model_limit=1,
+    ))
+    elapsed = time.perf_counter() - started
+
+    assert elapsed < 0.18
+    assert [result.experiment_id for result in results] == ["or_a", "or_b", "or_c", "oa"]
+    assert max_total <= 3
+    assert max_provider["openrouter"] <= 2
+    assert max_model[("openrouter", "model-a")] <= 1
+    assert len(sorted(tmp_path.glob("experiments_*.csv"))) == 1
+    assert len(sorted(tmp_path.glob("experiments_*.json"))) == 1
+
+
+def test_parallel_provider_waits_do_not_occupy_global_slots(tmp_path, monkeypatch):
+    runner = ExperimentRunner(tmp_path)
+    experiments = [
+        make_runner_experiment("oa1", "openai", "gpt-test"),
+        make_runner_experiment("oa2", "openai", "gpt-test"),
+        make_runner_experiment("an1", "anthropic", "claude-test"),
+    ]
+    started = []
+
+    async def fake_run_experiment(exp, repetition=1, max_retries=3):
+        started.append(exp.llm.provider)
+        await asyncio.sleep(0.05)
+        return ExperimentResult(
+            experiment_id=exp.id,
+            experiment_name=exp.name,
+            repetition=repetition,
+            timestamp="2026-04-22 10:00:00",
+            llm_provider=exp.llm.provider,
+            llm_model=exp.llm.model,
+            llm_temperature=exp.llm.temperature,
+            system_prompt=None,
+            user_prompt=exp.prompts.user_prompt,
+            success=True,
+            error_message=None,
+            execution_time_seconds=0.05,
+            psbt_generated=False,
+            psbt_base64=None,
+            psbt_file=None,
+            privacy_score=None,
+            privacy_grade=None,
+            privacy_breakdown=None,
+            tags=exp.tags,
+        )
+
+    monkeypatch.setattr(runner, "run_experiment", fake_run_experiment)
+
+    asyncio.run(runner.run_all(
+        experiments,
+        parallel_profile="provider",
+        max_concurrency=2,
+        provider_limits={"openai": 1, "anthropic": 1},
+    ))
+
+    assert set(started[:2]) == {"openai", "anthropic"}
+
+
+def test_runner_disables_agent_latest_psbt_files_in_batch_mode(tmp_path, monkeypatch):
+    seen_write_flags = []
+
+    class FakeAgent:
+        def __init__(self, *args, **kwargs):
+            seen_write_flags.append(kwargs.get("write_latest_psbt_files"))
+            self.last_psbt = "cHNidP8="
+            self.last_tool_trace = []
+            self.network = "testnet"
+
+        def setup(self, xpub, network):
+            self.network = network
+
+        async def chat(self, message):
+            return "PSBT: cHNidP8="
+
+    runner = ExperimentRunner(tmp_path)
+    runner._agent_class = FakeAgent
+    runner._privacy_scorer_class = None
+    exp = make_runner_experiment("batch", "openai", "gpt-test")
+
+    monkeypatch.chdir(tmp_path)
+    result = asyncio.run(runner.run_experiment(exp))
+
+    assert result.success is True
+    assert seen_write_flags == [False]
+    assert not (tmp_path / "psbt_latest.base64").exists()
+    assert not (tmp_path / "psbt_latest.psbt").exists()
+
+
+def test_parallel_runner_command_and_timeout_estimate():
+    metas = [
+        SimpleNamespace(provider="openai", model="gpt", timeout_seconds=300, repetitions=2),
+        SimpleNamespace(provider="openrouter", model="gemini", timeout_seconds=300, repetitions=3),
+        SimpleNamespace(provider="openrouter", model="gemma", timeout_seconds=300, repetitions=3),
+    ]
+
+    cmd = build_runner_command(
+        ["exp1", "exp2"],
+        parallel_profile="model",
+        max_concurrency=5,
+        provider_limits="openai=1,anthropic=1,openrouter=3",
+        model_limit=1,
+    )
+
+    assert "--parallel-profile" in cmd
+    assert "model" in cmd
+    assert "--provider-limits" in cmd
+    assert "openai=1,anthropic=1,openrouter=3" in cmd
+    assert parse_provider_limits("openai=1,openrouter=3") == {"openai": 1, "openrouter": 3}
+    assert estimate_runner_timeout_seconds(metas, parallel_profile="model", max_concurrency=5) < 3000
+
+
+def test_live_execution_status_reconstructs_progress_from_process_and_csv(tmp_path, monkeypatch):
+    matrix_csv = tmp_path / "matrix.csv"
+    matrix_csv.write_text(
+        "\n".join([
+            "id,name,provider,model,temperature,user_prompt,followup_prompts,repetitions,timeout_seconds,network,tags,enabled",
+            "exp_a,A,openai,gpt-test,0.3,prompt,,2,30,testnet,phase-2|prompt-basic,true",
+            "exp_b,B,openrouter,glm-test,0.3,prompt,,1,30,testnet,phase-2|prompt-basic,true",
+            "exp_disabled,Disabled,openai,gpt-test,0.3,prompt,,5,30,testnet,phase-2,false",
+        ]),
+        encoding="utf-8",
+    )
+    output_dir = tmp_path / "results"
+    output_dir.mkdir()
+    result_csv = output_dir / "experiments_20260427_120000.csv"
+    result_csv.write_text(
+        "\n".join([
+            "experiment_id,experiment_name,repetition,timestamp,llm_provider,llm_model,llm_temperature,user_prompt,success,error_message,execution_time_seconds,psbt_generated,privacy_score,privacy_grade,psbt_file,fee_sanity_ok,sanity_status,fee_rate_sat_vb,fee_sats,tags",
+            "exp_a,A,1,2026-04-27 12:00:30,openai,gpt-test,0.3,prompt,True,,10.0,True,80,A,/tmp/a.psbt,1,ok,3.0,420,phase-2",
+        ]),
+        encoding="utf-8",
+    )
+
+    command = f"/venv/bin/python {EXPERIMENTS_DIR / 'experiment_runner.py'} {matrix_csv} --filter ids:exp_a,exp_b --output {output_dir}"
+    info = parse_runner_command_info(command, pid=None, elapsed_seconds=42)
+    assert info is not None
+    assert info.input_file == matrix_csv
+    assert info.output_dir == output_dir
+
+    monkeypatch.setattr("web_ui.find_running_runner_commands", lambda: [info])
+    statuses = discover_live_execution_statuses()
+
+    assert len(statuses) == 1
+    assert statuses[0].expected_runs == 3
+    assert statuses[0].completed_runs == 1
+    assert statuses[0].psbt_runs == 1
+    assert statuses[0].last_experiment_id == "exp_a"
+    assert summarize_result_file(result_csv)["successful_runs"] == 1
+
+
 def test_run_selection_filters_can_be_combined():
     manager = ExperimentManager(EXPERIMENTS_DIR / "experiments.csv")
     df = experiments_dataframe(manager, manager.read_experiments())
@@ -324,11 +572,11 @@ def test_run_selection_filters_can_be_combined():
         strategies=["basic"],
         tags=["phase-1", "frontier"],
         tag_match="All selected tags",
-        search="gpt-5.4-pro",
+        search="gpt-5.4",
     )
 
     assert len(filtered) == 10
-    assert set(filtered["model"]) == {"gpt-5.4-pro"}
+    assert set(filtered["model"]) == {"gpt-5.4"}
     assert set(filtered["strategy"]) == {"basic"}
 
 
@@ -373,19 +621,19 @@ def test_run_selection_tags_and_pasted_ids_helpers():
     any_tag = filter_run_experiments(
         df,
         enabled_scope="Enabled only",
-        tags=["prompt-privacy-simple", "gpt54pro"],
+        tags=["prompt-privacy-simple", "gpt54"],
         tag_match="Any selected tag",
     )
     all_tags = filter_run_experiments(
         df,
         enabled_scope="Enabled only",
-        tags=["prompt-privacy-simple", "gpt54pro"],
+        tags=["prompt-privacy-simple", "gpt54"],
         tag_match="All selected tags",
     )
 
     assert len(any_tag) > len(all_tags)
     assert len(all_tags) == 10
-    assert set(all_tags["model"]) == {"gpt-5.4-pro"}
+    assert set(all_tags["model"]) == {"gpt-5.4"}
     assert set(all_tags["strategy"]) == {"privacy-simple"}
 
 
@@ -688,6 +936,46 @@ def test_paper_charts_aggregate_current_results_and_handle_missing_fee_columns()
     assert "fee_sanity_ok" in v2_df.columns
     assert build_paper_chart("Score heatmap", agg, v2_df).to_dict()
     assert build_paper_chart("Success and fee sanity", agg, v2_df).to_dict()
+
+
+def test_paper_charts_infer_phase2_prompt_and_category_from_tags():
+    phase2_like = pd.DataFrame([
+        {
+            "experiment_id": "exp_openrouter_glm51_multiturndetailed_pct10_t03",
+            "experiment_name": "Phase 2 - GLM-5.1 - multiturn-detailed - 10% - T0.3",
+            "llm_model": "z-ai/glm-5.1",
+            "llm_provider": "openrouter",
+            "tags": "phase-2;prompt-multiturn-detailed;amt-pct-10;openrouter;glm;open-weight",
+            "privacy_score": "80",
+            "execution_time_seconds": "12",
+            "psbt_generated": "True",
+            "fee_sanity_ok": "1",
+            "fee_rate_sat_vb": "3.0",
+        },
+        {
+            "experiment_id": "exp_openrouter_gemini31pro_multiturndetailed_pct10_t03",
+            "experiment_name": "Phase 2 - Gemini - multiturn-detailed - 10% - T0.3",
+            "llm_model": "google/gemini-3.1-pro-preview",
+            "llm_provider": "openrouter",
+            "tags": "phase-2;prompt-multiturn-detailed;amt-pct-10;openrouter;gemini;frontier",
+            "privacy_score": "83",
+            "execution_time_seconds": "12",
+            "psbt_generated": "True",
+            "fee_sanity_ok": "1",
+            "fee_rate_sat_vb": "3.0",
+        },
+    ])
+
+    agg = aggregate_current_results(phase2_like)
+    v2_df = current_results_v2_scores(phase2_like)
+
+    assert set(agg["prompt_type"]) == {"multiturn_detailed"}
+    assert set(v2_df["prompt_label"]) == {"Multi-turn Detailed"}
+    assert dict(zip(agg["model_full"], agg["category"])) == {
+        "google/gemini-3.1-pro-preview": "closed-source",
+        "z-ai/glm-5.1": "open-source",
+    }
+    assert build_paper_chart("Score heatmap", agg, v2_df).to_dict()
 
 
 def test_safe_prompt_mode_handles_older_meta_without_prompt_mode():
