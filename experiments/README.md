@@ -99,6 +99,9 @@ python experiment_runner.py experiments.csv --filter id:exp_openai_gpt54_basic_p
 # Run several selected experiments into one result file
 python experiment_runner.py experiments.csv --filter ids:exp_openai_gpt54_basic_pct10_t03,exp_openrouter_gemini31pro_basic_pct10_t03
 
+# Run an explicitly selected disabled row without changing the CSV enabled flag
+python experiment_runner.py experiments.csv --filter id:exp_anthropic_opus47_basic_pct10_t03 --include-disabled
+
 # Filter by provider, model, tag, or name
 python experiment_runner.py experiments.csv --filter provider:openai
 python experiment_runner.py experiments.csv --filter model:gpt-5.4
@@ -147,6 +150,7 @@ Main UI capabilities:
 - generate prompts from amount + strategy or preserve fully custom prompts,
 - run selected experiments through the CLI runner,
 - choose sequential, provider-lane, or model-lane execution,
+- run selected disabled rows explicitly; the UI passes `--include-disabled` only when needed,
 - monitor any active `experiment_runner.py` batch from the Results page, including terminal-launched runs,
 - inspect result tables, scores, fee sanity, PSBT paths, and comparison charts.
 
@@ -267,10 +271,11 @@ results/experiments_YYYYMMDD_HHMMSS.json
 The runner creates that pair for the batch and rewrites it incrementally after each completed run, so the Streamlit Results view can inspect a live batch while it is still executing. The Results page also detects active `experiment_runner.py` processes, reconstructs the expected run count from the command's CSV/filter when possible, and auto-refreshes a live progress panel. The CSV is the compact summary. The JSON keeps detailed scorer breakdowns, agent responses, and PSBT metadata when available. Binary and Base64 PSBTs are saved under:
 
 ```text
-results/psbts/
+results/psbts/YYYYMMDD_HHMMSS/
 ```
 
 These files are local research artifacts and are intentionally ignored by Git.
+The timestamped subdirectory matches the result CSV/JSON pair, so rerunning the same experiment ID does not overwrite older PSBT artifacts.
 
 ## Basic Checks
 

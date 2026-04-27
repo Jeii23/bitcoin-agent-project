@@ -496,9 +496,13 @@ class ExperimentRunner:
             if response is None and last_error:
                 raise last_error
             
-            # Execute follow-up prompts if any (with retry logic)
-            for followup in exp.prompts.followup_prompts:
+            # Execute follow-up prompts if any (with retry logic).  Follow-ups
+            # are part of the experiment contract; if one fails, do not score a
+            # PSBT left over from an earlier turn as if the full strategy ran.
+            for followup_index, followup in enumerate(exp.prompts.followup_prompts, 1):
+                agent.last_psbt = None
                 followup_retry = 0
+                followup_completed = False
                 while followup_retry <= max_retries:
                     try:
                         response = await asyncio.wait_for(
@@ -506,10 +510,17 @@ class ExperimentRunner:
                             timeout=exp.settings.timeout_seconds
                         )
                         logger.debug(f"  Follow-up response preview: {str(response)[:200]}...")
+                        followup_completed = True
                         break
                     except asyncio.TimeoutError:
-                        logger.warning(f"Timeout on followup prompt: {followup[:50]}...")
-                        break
+                        result.error_message = (
+                            f"Timeout on followup prompt {followup_index} "
+                            f"after {exp.settings.timeout_seconds}s"
+                        )
+                        result.agent_response = str(response)[:2000] if response else None
+                        result.tool_trace = getattr(agent, "last_tool_trace", None)
+                        logger.warning("%s: %s...", result.error_message, followup[:50])
+                        return result
                     except Exception as e:
                         error_str = str(e)
                         if _is_retryable_error(e):
@@ -527,8 +538,16 @@ class ExperimentRunner:
                                 logger.warning(f"  Retryable error on followup, waiting {wait_time}s...")
                                 await asyncio.sleep(wait_time)
                                 continue
-                        logger.warning(f"Error on followup prompt: {e}")
-                        break
+                        result.error_message = f"Error on followup prompt {followup_index}: {e}"
+                        result.agent_response = str(response)[:2000] if response else None
+                        result.tool_trace = getattr(agent, "last_tool_trace", None)
+                        logger.warning(result.error_message)
+                        return result
+                if not followup_completed:
+                    result.error_message = f"Followup prompt {followup_index} did not complete"
+                    result.agent_response = str(response)[:2000] if response else None
+                    result.tool_trace = getattr(agent, "last_tool_trace", None)
+                    return result
             
             # Extract PSBT from agent (primary method)
             psbt_base64 = agent.last_psbt
@@ -551,7 +570,7 @@ class ExperimentRunner:
                 
                 # Save PSBT to file
                 if exp.settings.save_psbt:
-                    psbt_dir = self.output_dir / "psbts"
+                    psbt_dir = self.output_dir / "psbts" / self._run_timestamp
                     psbt_dir.mkdir(parents=True, exist_ok=True)
                     psbt_filename = f"{exp.id}_rep{repetition}.psbt"
                     psbt_path = psbt_dir / psbt_filename
@@ -717,9 +736,15 @@ class ExperimentRunner:
             ]
             self._persist_results_snapshot()
 
-    def _select_active_experiments(self, experiments: List[Experiment], filter_fn=None, interleave: bool = False) -> List[Experiment]:
+    def _select_active_experiments(
+        self,
+        experiments: List[Experiment],
+        filter_fn=None,
+        interleave: bool = False,
+        include_disabled: bool = False,
+    ) -> List[Experiment]:
         """Filter, sort, and optionally interleave experiments before expanding repetitions."""
-        active_experiments = [e for e in experiments if e.enabled]
+        active_experiments = list(experiments) if include_disabled else [e for e in experiments if e.enabled]
 
         if filter_fn:
             active_experiments = [e for e in active_experiments if filter_fn(e)]
@@ -777,6 +802,7 @@ class ExperimentRunner:
         max_concurrency: Optional[int] = None,
         provider_limits: Optional[Dict[str, int]] = None,
         model_limit: Optional[int] = None,
+        include_disabled: bool = False,
     ) -> List[ExperimentResult]:
         """Run all experiments.
         
@@ -789,8 +815,14 @@ class ExperimentRunner:
             max_concurrency: Maximum concurrent experiment repetitions
             provider_limits: Optional per-provider concurrency limits
             model_limit: Optional per-provider/model concurrency limit
+            include_disabled: If True, allow filtered disabled rows to run
         """
-        active_experiments = self._select_active_experiments(experiments, filter_fn, interleave)
+        active_experiments = self._select_active_experiments(
+            experiments,
+            filter_fn,
+            interleave,
+            include_disabled=include_disabled,
+        )
         tasks = self._build_tasks(active_experiments)
         resolved_max, resolved_provider_limits, resolved_model_limit = self._parallel_defaults(
             parallel_profile,
@@ -1046,6 +1078,11 @@ Examples:
     parser.add_argument("--experiment", type=str, help="Run only a specific experiment by ID (shortcut for --filter id:...)")
     parser.add_argument("--output", type=Path, default=Path("results"), help="Output directory for results")
     parser.add_argument("--dry-run", action="store_true", help="Parse and validate without executing")
+    parser.add_argument(
+        "--include-disabled",
+        action="store_true",
+        help="Allow disabled CSV rows to run when selected by filter or experiment ID",
+    )
     parser.add_argument("--interleave", action="store_true", help="Interleave experiments by provider (round-robin: openai, anthropic, google)")
     parser.add_argument("--delay", type=float, default=0, help="Delay in seconds between experiments (helps avoid rate limits)")
     parser.add_argument(
@@ -1125,6 +1162,7 @@ Examples:
         max_concurrency=args.max_concurrency,
         provider_limits=provider_limits,
         model_limit=args.model_limit,
+        include_disabled=args.include_disabled,
     ))
     
     # Save results

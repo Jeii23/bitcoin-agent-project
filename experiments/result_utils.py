@@ -172,10 +172,13 @@ def load_results_dataframe(csv_path: Path, manager=None) -> pd.DataFrame:
             amount_display = None
             if hasattr(manager, "infer_amount_display"):
                 amount_display = manager.infer_amount_display(exp)
+            amount_btc = meta.amount_btc
+            if hasattr(manager, "infer_amount_percent") and manager.infer_amount_percent(exp) is not None:
+                amount_btc = None
             metadata_by_id[meta.id] = {
                 "strategy": meta.strategy,
                 "amount_display": amount_display,
-                "amount_btc": meta.amount_btc,
+                "amount_btc": amount_btc,
                 "experiment_tags": "|".join(meta.tags),
                 "prompt_mode": prompt_mode,
             }

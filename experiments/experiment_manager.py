@@ -300,12 +300,14 @@ class ExperimentManager:
             followup_prompts = self._join_pipe(exp_meta.followup_prompts)
 
         # Create CSV row
+        structured_amount = str(exp_meta.amount_btc) if prompt_mode == "template" else ""
+        structured_strategy = exp_meta.strategy if prompt_mode == "template" else ""
         row = {
             'id': exp_meta.id,
             'name': exp_meta.name,
             'description': exp_meta.description,
-            'amount_btc': str(exp_meta.amount_btc),
-            'strategy': exp_meta.strategy,
+            'amount_btc': structured_amount,
+            'strategy': structured_strategy,
             'prompt_mode': prompt_mode,
             'provider': exp_meta.provider,
             'model': exp_meta.model,

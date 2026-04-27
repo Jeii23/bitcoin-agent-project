@@ -47,6 +47,7 @@ from streamlit.testing.v1 import AppTest
 from web_ui import (
     all_tags_from_dataframe,
     build_runner_command,
+    build_comparison_summary,
     discover_live_execution_statuses,
     estimate_runner_timeout_seconds,
     experiments_dataframe,
@@ -99,6 +100,12 @@ def test_amount_display_inference_from_percentage_tags():
         "user_prompt": "Fes-me una PSBT que envii aproximadament el 30% del saldo actual del wallet a una de les meves adreces",
     }
     assert ExperimentManager.infer_amount_display(row) == "30% of wallet balance"
+
+    manager = ExperimentManager(EXPERIMENTS_DIR / "experiments.csv")
+    df = experiments_dataframe(manager, manager.read_experiments())
+    pct_row = df[df["id"] == "exp_openai_gpt54_basic_pct10_t03"].iloc[0]
+    assert pct_row["amount_display"] == "10% of wallet balance"
+    assert pd.isna(pct_row["amount_btc"])
 
 
 def test_current_csv_2026_matrix_shape_and_model_selection():
@@ -251,6 +258,38 @@ def test_template_mode_preserves_prompt_when_unrelated_field_changes(tmp_path):
     updated = manager.read_experiment_by_id("template")
     assert updated["user_prompt"] == prompt
     assert updated["model"] == "gpt-5.2-pro"
+
+
+def test_custom_prompt_creation_does_not_persist_structured_amount_or_strategy(tmp_path):
+    csv_path = tmp_path / "experiments.csv"
+    manager = ExperimentManager(csv_path)
+
+    manager.add_experiment(SimpleNamespace(
+        id="custom",
+        name="Custom",
+        description="",
+        amount_btc=0.5,
+        strategy="privacy-simple",
+        prompt_mode="custom",
+        provider="openai",
+        model="gpt-test",
+        temperature=1.0,
+        system_prompt="",
+        user_prompt="Fes-me una PSBT que envii aproximadament el 10% del saldo",
+        followup_prompts=[],
+        repetitions=1,
+        timeout_seconds=300,
+        network="mainnet",
+        tags=["custom"],
+        enabled=True,
+        priority=1,
+        xpub="",
+    ))
+
+    row = manager.read_experiment_by_id("custom")
+    assert row["amount_btc"] == ""
+    assert row["strategy"] == ""
+    assert row["user_prompt"].startswith("Fes-me una PSBT")
 
 
 def test_ids_filter_and_scorer_import():
@@ -469,6 +508,77 @@ def test_parallel_provider_waits_do_not_occupy_global_slots(tmp_path, monkeypatc
     assert set(started[:2]) == {"openai", "anthropic"}
 
 
+def test_runner_can_opt_in_to_disabled_rows(tmp_path, monkeypatch):
+    runner = ExperimentRunner(tmp_path)
+    exp = make_runner_experiment("disabled", "openai", "gpt-test")
+    exp.enabled = False
+    seen = []
+
+    async def fake_run_experiment(exp, repetition=1, max_retries=3):
+        seen.append(exp.id)
+        return ExperimentResult(
+            experiment_id=exp.id,
+            experiment_name=exp.name,
+            repetition=repetition,
+            timestamp="2026-04-22 10:00:00",
+            llm_provider=exp.llm.provider,
+            llm_model=exp.llm.model,
+            llm_temperature=exp.llm.temperature,
+            system_prompt=None,
+            user_prompt=exp.prompts.user_prompt,
+            success=True,
+            error_message=None,
+            execution_time_seconds=0.0,
+            psbt_generated=False,
+            psbt_base64=None,
+            psbt_file=None,
+            privacy_score=None,
+            privacy_grade=None,
+            privacy_breakdown=None,
+            tags=exp.tags,
+        )
+
+    monkeypatch.setattr(runner, "run_experiment", fake_run_experiment)
+    assert asyncio.run(runner.run_all([exp])) == []
+    assert seen == []
+
+    runner = ExperimentRunner(tmp_path / "included")
+    monkeypatch.setattr(runner, "run_experiment", fake_run_experiment)
+    results = asyncio.run(runner.run_all([exp], include_disabled=True))
+    assert [result.experiment_id for result in results] == ["disabled"]
+    assert seen == ["disabled"]
+
+
+def test_followup_timeout_does_not_score_stale_main_prompt_psbt(tmp_path):
+    class FakeAgent:
+        def __init__(self, *args, **kwargs):
+            self.last_psbt = None
+            self.last_tool_trace = []
+
+        def setup(self, xpub, network):
+            pass
+
+        async def chat(self, message):
+            if message == "main":
+                self.last_psbt = "cHNidP8="
+                return "main response with psbt"
+            raise asyncio.TimeoutError()
+
+    runner = ExperimentRunner(tmp_path)
+    runner._agent_class = FakeAgent
+    runner._privacy_scorer_class = None
+    exp = make_runner_experiment("multi", "openai", "gpt-test")
+    exp.prompts.user_prompt = "main"
+    exp.prompts.followup_prompts = ["followup"]
+
+    result = asyncio.run(runner.run_experiment(exp))
+
+    assert result.success is False
+    assert result.psbt_generated is False
+    assert result.psbt_base64 is None
+    assert "followup prompt 1" in result.error_message.lower()
+
+
 def test_runner_disables_agent_latest_psbt_files_in_batch_mode(tmp_path, monkeypatch):
     seen_write_flags = []
 
@@ -495,6 +605,9 @@ def test_runner_disables_agent_latest_psbt_files_in_batch_mode(tmp_path, monkeyp
 
     assert result.success is True
     assert seen_write_flags == [False]
+    psbt_path = Path(result.psbt_file)
+    assert psbt_path.exists()
+    assert psbt_path.parent.name == runner._run_timestamp
     assert not (tmp_path / "psbt_latest.base64").exists()
     assert not (tmp_path / "psbt_latest.psbt").exists()
 
@@ -512,12 +625,14 @@ def test_parallel_runner_command_and_timeout_estimate():
         max_concurrency=5,
         provider_limits="openai=1,anthropic=1,openrouter=3",
         model_limit=1,
+        include_disabled=True,
     )
 
     assert "--parallel-profile" in cmd
     assert "model" in cmd
     assert "--provider-limits" in cmd
     assert "openai=1,anthropic=1,openrouter=3" in cmd
+    assert "--include-disabled" in cmd
     assert parse_provider_limits("openai=1,openrouter=3") == {"openai": 1, "openrouter": 3}
     assert estimate_runner_timeout_seconds(metas, parallel_profile="model", max_concurrency=5) < 3000
 
@@ -544,11 +659,12 @@ def test_live_execution_status_reconstructs_progress_from_process_and_csv(tmp_pa
         encoding="utf-8",
     )
 
-    command = f"/venv/bin/python {EXPERIMENTS_DIR / 'experiment_runner.py'} {matrix_csv} --filter ids:exp_a,exp_b --output {output_dir}"
+    command = f"/venv/bin/python {EXPERIMENTS_DIR / 'experiment_runner.py'} {matrix_csv} --filter ids:exp_a,exp_b --output {output_dir} --include-disabled"
     info = parse_runner_command_info(command, pid=None, elapsed_seconds=42)
     assert info is not None
     assert info.input_file == matrix_csv
     assert info.output_dir == output_dir
+    assert info.include_disabled is True
 
     monkeypatch.setattr("web_ui.find_running_runner_commands", lambda: [info])
     statuses = discover_live_execution_statuses()
@@ -683,6 +799,29 @@ def test_result_loading_can_combine_multiple_result_files(tmp_path):
     assert df["source_file"].tolist() == [paths[0].name, paths[1].name]
     assert df["experiment_id"].tolist() == ["exp1", "exp2"]
     assert set(df["llm_model"]) == {"gpt-test", "qwen-test"}
+
+
+def test_comparison_summary_keeps_failed_no_score_attempts_in_success_rate():
+    df = pd.DataFrame([
+        {
+            "llm_model": "gpt-test",
+            "success": "True",
+            "privacy_score": "80",
+            "execution_time_seconds": "10",
+        },
+        {
+            "llm_model": "gpt-test",
+            "success": "False",
+            "privacy_score": "",
+            "execution_time_seconds": "300",
+        },
+    ])
+
+    summary = build_comparison_summary(df, "llm_model")
+
+    assert summary.loc["gpt-test", "success_rate_pct"] == 50.0
+    assert summary.loc["gpt-test", "attempts"] == 2
+    assert summary.loc["gpt-test", "privacy_score_count"] == 1
 
 
 def test_results_display_dataframe_is_arrow_compatible_with_mixed_fee_sanity(tmp_path):

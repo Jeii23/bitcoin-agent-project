@@ -91,6 +91,7 @@ class RunnerCommandInfo:
     filter_expr: Optional[str] = None
     experiment_id: Optional[str] = None
     dry_run: bool = False
+    include_disabled: bool = False
 
 
 @dataclass
@@ -292,6 +293,7 @@ def experiments_dataframe(manager: ExperimentManager, experiments: List[Dict]) -
     for exp in experiments:
         meta = manager.parse_csv_row_to_meta(exp)
         prompt_mode = safe_prompt_mode(manager, exp, meta)
+        amount_btc = None if manager.infer_amount_percent(exp) is not None else meta.amount_btc
         rows.append({
             "id": meta.id,
             "name": meta.name,
@@ -299,7 +301,7 @@ def experiments_dataframe(manager: ExperimentManager, experiments: List[Dict]) -
             "model": meta.model,
             "strategy": meta.strategy,
             "amount_display": manager.infer_amount_display(exp),
-            "amount_btc": meta.amount_btc,
+            "amount_btc": amount_btc,
             "prompt_mode": prompt_mode,
             "temperature": meta.temperature,
             "repetitions": meta.repetitions,
@@ -317,6 +319,7 @@ def build_runner_command(
     interleave: bool = False,
     delay: float = 0,
     dry_run: bool = False,
+    include_disabled: bool = False,
     parallel_profile: str = "sequential",
     max_concurrency: Optional[int] = None,
     provider_limits: str = "",
@@ -346,6 +349,8 @@ def build_runner_command(
         cmd.extend(["--model-limit", str(model_limit)])
     if dry_run:
         cmd.append("--dry-run")
+    if include_disabled:
+        cmd.append("--include-disabled")
     return cmd
 
 
@@ -436,6 +441,7 @@ def parse_runner_command_info(command: str, *, pid: Optional[int] = None, elapse
     filter_expr = None
     experiment_id = None
     dry_run = False
+    include_disabled = False
     idx = runner_idx + 2
     while idx < len(tokens):
         token = tokens[idx]
@@ -459,6 +465,8 @@ def parse_runner_command_info(command: str, *, pid: Optional[int] = None, elapse
             experiment_id = token.split("=", 1)[1]
         elif token == "--dry-run":
             dry_run = True
+        elif token == "--include-disabled":
+            include_disabled = True
         idx += 1
 
     output_dir = _resolve_process_path(output_token, cwd) or (SCRIPT_DIR / "results")
@@ -471,6 +479,7 @@ def parse_runner_command_info(command: str, *, pid: Optional[int] = None, elapse
         filter_expr=filter_expr,
         experiment_id=experiment_id,
         dry_run=dry_run,
+        include_disabled=include_disabled,
     )
 
 
@@ -518,7 +527,7 @@ def expected_runs_for_command(info: RunnerCommandInfo) -> Optional[int]:
         from experiment_runner import ExperimentCSVParser, create_filter
 
         experiments = ExperimentCSVParser(info.input_file).parse()
-        active = [exp for exp in experiments if exp.enabled]
+        active = list(experiments) if info.include_disabled else [exp for exp in experiments if exp.enabled]
         if info.experiment_id:
             active = [exp for exp in active if exp.id == info.experiment_id]
         elif info.filter_expr:
@@ -677,6 +686,26 @@ def choose_results_dataframe(
 
     results_df = load_many_results_dataframes(selected_files, manager=manager)
     return results_df, selected_files
+
+
+def build_comparison_summary(results_df: pd.DataFrame, by_col: str) -> pd.DataFrame:
+    """Aggregate comparison rows without dropping failed/no-score attempts."""
+    chart_df = results_df.copy()
+    chart_df['privacy_score'] = pd.to_numeric(chart_df['privacy_score'], errors='coerce')
+    chart_df['execution_time_seconds'] = pd.to_numeric(chart_df['execution_time_seconds'], errors='coerce')
+    chart_df['success_rate'] = truthy_series(chart_df['success']).astype(float)
+
+    score_grouped = chart_df.dropna(subset=['privacy_score']).groupby(by_col).agg({
+        'privacy_score': ['mean', 'std', 'min', 'max', 'count'],
+        'execution_time_seconds': 'mean',
+    }).round(2)
+    score_grouped.columns = [
+        "_".join(str(part) for part in column if str(part))
+        for column in score_grouped.columns.to_flat_index()
+    ]
+    success_grouped = (chart_df.groupby(by_col)['success_rate'].mean() * 100).round(2).rename("success_rate_pct")
+    attempts_grouped = chart_df.groupby(by_col).size().rename("attempts")
+    return score_grouped.join(success_grouped, how="outer").join(attempts_grouped, how="outer")
 
 
 @st.fragment(run_every="10s")
@@ -1207,8 +1236,6 @@ def show_edit_experiment(manager: ExperimentManager):
             updates = {
                 'name': name,
                 'description': description,
-                'amount_btc': str(amount_btc),
-                'strategy': strategy,
                 'provider': provider,
                 'model': model,
                 'temperature': str(temperature),
@@ -1221,6 +1248,12 @@ def show_edit_experiment(manager: ExperimentManager):
                 'prompt_mode': prompt_mode,
                 '_regenerate_prompts': regenerate_prompts if prompt_mode == 'template' else False,
             }
+            if prompt_mode == 'template':
+                updates['amount_btc'] = str(amount_btc)
+                updates['strategy'] = strategy
+            else:
+                updates['amount_btc'] = ''
+                updates['strategy'] = ''
             if prompt_mode == 'custom':
                 if not custom_user_prompt.strip():
                     st.error("Custom prompt mode requires a user prompt")
@@ -1281,18 +1314,20 @@ def show_clone_experiment(manager: ExperimentManager):
 
     if modify_strategy:
         new_strategy = st.selectbox("New Strategy", [s.value for s in PromptStrategy], index=[s.value for s in PromptStrategy].index(src_meta.strategy))
+    if (modify_amount or modify_strategy) and clone_prompt_mode.startswith("keep current"):
+        st.caption("Amount/strategy changes only affect the prompt when template regeneration is selected.")
 
     if st.button("✓ Clone Experiment"):
         try:
             updates = {}
             if modify_model and new_model:
                 updates['model'] = new_model
-            if modify_amount and new_amount:
-                updates['amount_btc'] = str(new_amount)
-            if modify_strategy and new_strategy:
-                updates['strategy'] = new_strategy
             if (modify_amount or modify_strategy) and clone_prompt_mode.startswith("use template"):
                 updates['prompt_mode'] = 'template'
+                if modify_amount and new_amount:
+                    updates['amount_btc'] = str(new_amount)
+                if modify_strategy and new_strategy:
+                    updates['strategy'] = new_strategy
 
             manager.clone_experiment(src_id, new_id, updates)
             st.success(f"✓ Experiment cloned to '{new_id}'!")
@@ -1479,6 +1514,9 @@ def show_run_experiments(manager: ExperimentManager):
 
         selected_experiments = [e for e in experiments if e.get('id') in selected_ids]
         selected_meta = [manager.parse_csv_row_to_meta(e) for e in selected_experiments]
+        include_disabled = any(not manager.parse_csv_row_to_meta(e).enabled for e in selected_experiments)
+        if include_disabled:
+            st.warning("This selection includes disabled rows; the runner will use --include-disabled for this batch.")
         estimated_timeout = estimate_runner_timeout_seconds(
             selected_meta,
             parallel_profile=parallel_profile,
@@ -1494,6 +1532,7 @@ def show_run_experiments(manager: ExperimentManager):
             interleave=interleave,
             delay=delay,
             dry_run=dry_run,
+            include_disabled=include_disabled,
             parallel_profile=parallel_profile,
             max_concurrency=int(max_concurrency),
             provider_limits=provider_limits,
@@ -1684,17 +1723,16 @@ def show_compare_results(manager: ExperimentManager):
     else:
         st.warning("Comparison not available for this dimension")
         return
+    if results_df[by_col].dropna().empty:
+        st.warning("Comparison not available because this dimension has no concrete values in the selected results.")
+        return
 
     # Group and aggregate
     chart_df = results_df.copy()
     chart_df['privacy_score'] = pd.to_numeric(chart_df['privacy_score'], errors='coerce')
     chart_df['execution_time_seconds'] = pd.to_numeric(chart_df['execution_time_seconds'], errors='coerce')
     chart_df['success_rate'] = truthy_series(chart_df['success']).astype(float)
-    grouped = chart_df.dropna(subset=['privacy_score']).groupby(by_col).agg({
-        'privacy_score': ['mean', 'std', 'min', 'max', 'count'],
-        'success_rate': 'mean',
-        'execution_time_seconds': 'mean',
-    }).round(2)
+    grouped = build_comparison_summary(results_df, by_col)
 
     st.subheader(f"Comparison by {comparison_type}")
     show_dataframe(grouped, width='stretch')
