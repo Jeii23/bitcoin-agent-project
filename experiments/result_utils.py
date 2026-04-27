@@ -169,14 +169,18 @@ def load_results_dataframe(csv_path: Path, manager=None) -> pd.DataFrame:
                 prompt_mode = manager.infer_prompt_mode(exp)
             if prompt_mode not in ("template", "custom"):
                 prompt_mode = "template" if exp.get("amount_btc") or exp.get("strategy") else "custom"
+            amount_display = None
+            if hasattr(manager, "infer_amount_display"):
+                amount_display = manager.infer_amount_display(exp)
             metadata_by_id[meta.id] = {
                 "strategy": meta.strategy,
+                "amount_display": amount_display,
                 "amount_btc": meta.amount_btc,
                 "experiment_tags": "|".join(meta.tags),
                 "prompt_mode": prompt_mode,
             }
 
-        for col in ("strategy", "amount_btc", "experiment_tags", "prompt_mode"):
+        for col in ("strategy", "amount_display", "amount_btc", "experiment_tags", "prompt_mode"):
             if col not in df.columns:
                 df[col] = pd.Series([None] * len(df), dtype="object")
             else:
@@ -219,6 +223,7 @@ def display_columns(columns: Iterable[str]) -> list[str]:
         "llm_provider",
         "llm_model",
         "strategy",
+        "amount_display",
         "amount_btc",
         "success",
         "psbt_generated",

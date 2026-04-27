@@ -12,6 +12,7 @@ import base64
 import re
 import logging
 import time
+import threading
 from typing import TypedDict, List, Dict, Optional, Literal, Annotated, Sequence, Tuple, Any, Union
 from decimal import Decimal
 from datetime import datetime
@@ -115,6 +116,7 @@ if DEFAULT_NETWORK not in ["mainnet", "testnet"]:
 
 # Module-level logger
 logger = logging.getLogger(__name__)
+_SCANTXOUTSET_LOCK = threading.Lock()
 
 
 # ============== LLM FACTORY ==============
@@ -167,6 +169,33 @@ LLM_PROVIDERS = {
         "base_url": "https://openrouter.ai/api/v1",
     },
 }
+
+OPENAI_RESPONSES_API_MODEL_PREFIXES = (
+    "gpt-5.4-pro",
+)
+
+ANTHROPIC_TEMPERATURELESS_MODEL_PREFIXES = (
+    "claude-opus-4-7",
+)
+
+
+def _model_name(model: Optional[str]) -> str:
+    """Return a normalized lowercase model name."""
+    return (model or "").strip().lower()
+
+
+def _requires_openai_responses_api(model: Optional[str]) -> bool:
+    """Detect OpenAI models that must use the Responses API."""
+    model_name = _model_name(model)
+    return any(model_name.startswith(prefix) for prefix in OPENAI_RESPONSES_API_MODEL_PREFIXES)
+
+
+def _anthropic_supports_temperature(model: Optional[str]) -> bool:
+    """Detect Anthropic models that still accept an explicit temperature parameter."""
+    model_name = _model_name(model)
+    return not any(
+        model_name.startswith(prefix) for prefix in ANTHROPIC_TEMPERATURELESS_MODEL_PREFIXES
+    )
 
 
 def create_llm(
@@ -231,11 +260,18 @@ def create_llm(
 
     # Create the appropriate LLM instance
     if provider == "openai":
+        openai_kwargs = {
+            "api_key": api_key,
+            "model": model,
+            "streaming": False,
+        }
+        if temperature is not None:
+            openai_kwargs["temperature"] = temperature
+        if _requires_openai_responses_api(model):
+            logger.info("Using OpenAI Responses API compatibility mode for model=%s", model)
+            openai_kwargs["use_responses_api"] = True
         llm = ChatOpenAI(
-            api_key=api_key,
-            model=model,
-            temperature=temperature,
-            streaming=False,
+            **openai_kwargs,
         )
     elif provider == "anthropic":
         if not ANTHROPIC_AVAILABLE:
@@ -243,11 +279,19 @@ def create_llm(
                 "Anthropic (Claude) support requires langchain-anthropic. "
                 "Install with: pip install langchain-anthropic"
             )
-        llm = ChatAnthropic(
-            api_key=api_key,
-            model=model,
-            temperature=temperature,
-        )
+        anthropic_kwargs = {
+            "api_key": api_key,
+            "model": model,
+        }
+        if _anthropic_supports_temperature(model):
+            if temperature is not None:
+                anthropic_kwargs["temperature"] = temperature
+        else:
+            logger.info(
+                "Omitting deprecated Anthropic temperature parameter for model=%s",
+                model,
+            )
+        llm = ChatAnthropic(**anthropic_kwargs)
     elif provider == "google":
         if not GOOGLE_GENAI_AVAILABLE:
             raise ValueError(
@@ -399,6 +443,94 @@ def _extract_text_content(content) -> str:
     return str(content)
 
 
+def _preview_text(value: Any, limit: int = 400) -> str:
+    """Return a compact single-line preview for debugging traces."""
+    text = _extract_text_content(value)
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) > limit:
+        return text[:limit] + "..."
+    return text
+
+
+def _summarize_tool_result_content(content: Any) -> Dict[str, Any]:
+    """Summarize tool output into a compact, JSON-friendly debugging payload."""
+    parsed = content
+    if isinstance(content, str):
+        try:
+            parsed = json.loads(content)
+        except Exception:
+            parsed = content
+
+    if isinstance(parsed, dict):
+        summary: Dict[str, Any] = {}
+        for key in (
+            "success",
+            "error",
+            "note",
+            "network",
+            "provider",
+            "provider_primary",
+            "provider_any_used",
+            "network_errors",
+            "total_utxos",
+            "total_value_satoshis",
+            "total_value_btc",
+            "balance_satoshis",
+            "balance_btc",
+            "receive_addresses_checked",
+            "change_addresses_checked",
+            "address",
+            "index",
+            "path",
+            "fastest_fee",
+            "half_hour_fee",
+            "hour_fee",
+            "economy_fee",
+            "minimum_fee",
+            "fee_satoshis",
+            "fee_sats",
+            "num_inputs",
+            "num_outputs",
+            "selection_mode",
+        ):
+            if key in parsed:
+                summary[key] = parsed.get(key)
+
+        utxos = parsed.get("utxos")
+        if isinstance(utxos, list):
+            summary["utxo_count"] = len(utxos)
+            if utxos:
+                summary["utxo_sample"] = [
+                    {
+                        "txid": str(u.get("txid", ""))[:12],
+                        "vout": u.get("vout"),
+                        "value_satoshis": u.get("value_satoshis", u.get("value")),
+                        "confirmations": u.get("confirmations"),
+                    }
+                    for u in utxos[:3]
+                    if isinstance(u, dict)
+                ]
+
+        checked = parsed.get("checked")
+        if isinstance(checked, list):
+            summary["checked_count"] = len(checked)
+
+        outputs = parsed.get("outputs_detail")
+        if isinstance(outputs, list):
+            summary["outputs_count"] = len(outputs)
+
+        summary["raw_preview"] = _preview_text(parsed)
+        return summary
+
+    if isinstance(parsed, list):
+        return {
+            "list_count": len(parsed),
+            "raw_preview": _preview_text(parsed),
+        }
+
+    return {"raw_preview": _preview_text(parsed)}
+
+
 def _sanitize_psbt_b64(b64_text: str) -> str:
     """Sanitize a PSBT base64 string by removing whitespace and validating magic bytes.
 
@@ -505,16 +637,28 @@ def _core_rpc_call(method: str, params: List) -> Dict:
 def _core_scantxoutset(addresses: List[str]) -> List[Dict]:
     """Query Core via scantxoutset for UTXOs belonging to addresses (no wallet import required)."""
     scanobjects = [f"addr({a})" for a in addresses]
-    res = _core_rpc_call("scantxoutset", ["start", scanobjects]) or {}
+    # Bitcoin Core only supports one active scantxoutset at a time.
+    # Some models emit parallel tool calls (e.g. list_utxos + generate_address),
+    # so we serialize these scans to avoid false "wallet empty" results.
+    with _SCANTXOUTSET_LOCK:
+        res = _core_rpc_call("scantxoutset", ["start", scanobjects]) or {}
+    chain_height = int(res.get("height") or 0)
     utxos: List[Dict] = []
     for u in (res.get("unspents") or []):
         btc_amount = float(u.get("amount", 0.0))
+        desc = u.get("desc", "") or ""
+        m = re.search(r"addr\(([^)]+)\)", desc)
+        utxo_height = u.get("height")
+        confirmations = 0
+        if isinstance(utxo_height, int) and utxo_height > 0 and chain_height >= utxo_height:
+            confirmations = chain_height - utxo_height + 1
         utxos.append({
             "txid": u.get("txid"),
             "vout": u.get("vout"),
             "value": int(round(btc_amount * 100_000_000)),
-            "address": (u.get("desc", "").split("(")[-1].rstrip(")")) or None,
+            "address": m.group(1) if m else None,
             "height": u.get("height"),
+            "confirmations": confirmations,
         })
     return utxos
 
@@ -655,6 +799,179 @@ def _enumerate_addresses(xpub: str, network: str, receive_limit: int, change_lim
     return addresses
 
 
+DEFAULT_SCAN_RECEIVE = 10
+DEFAULT_SCAN_CHANGE = 5
+AUTO_EXTEND_EMPTY_RECEIVE = 50
+AUTO_EXTEND_EMPTY_CHANGE = 20
+MAX_SCAN_RECEIVE = 200
+MAX_SCAN_CHANGE = 100
+SCAN_EDGE_BUFFER = 2
+
+
+def _get_scan_limit(env_name: str, default: int) -> int:
+    """Read a positive integer scan limit from the environment."""
+    try:
+        value = int(os.getenv(env_name, str(default)))
+        return value if value > 0 else default
+    except Exception:
+        return default
+
+
+def _normalize_utxo_result(entry: Dict[str, Any], utxo: Dict[str, Any]) -> Dict[str, Any]:
+    """Attach derivation metadata to a raw UTXO result."""
+    confirmations = utxo.get("confirmations")
+    if confirmations is None:
+        confirmations = utxo.get("status", {}).get("confirmations", 0)
+    return {
+        "txid": utxo.get("txid", ""),
+        "vout": utxo.get("vout", 0),
+        "value_satoshis": utxo.get("value", 0),
+        "value_btc": utxo.get("value", 0) / 100_000_000,
+        "address": entry["address"],
+        "path": entry["path"],
+        "index": entry["index"],
+        "change": entry["change"],
+        "confirmations": confirmations,
+    }
+
+
+def _scan_address_entries(address_entries: List[Dict[str, Any]], network: str) -> Tuple[List[Dict[str, Any]], int, List[str]]:
+    """Fetch UTXOs for a set of derived addresses.
+
+    On Core, batch a single scantxoutset call per scan round to avoid rescanning the UTXO
+    set once per address. On REST providers, preserve the existing per-address behavior.
+    """
+    if not address_entries:
+        return [], 0, []
+
+    providers = _provider_sequence(network)
+    if providers and providers[0][0] == "core":
+        try:
+            entry_by_address = {entry["address"]: entry for entry in address_entries}
+            core_utxos = _core_scantxoutset(list(entry_by_address.keys()))
+            all_utxos = []
+            for utxo in core_utxos:
+                entry = entry_by_address.get(utxo.get("address"))
+                if entry is None:
+                    continue
+                all_utxos.append(_normalize_utxo_result(entry, utxo))
+            return all_utxos, 0, ["core"]
+        except Exception:
+            return [], len(address_entries), []
+
+    all_utxos: List[Dict[str, Any]] = []
+    network_errors = 0
+    providers_used: List[str] = []
+    for entry in address_entries:
+        _ret = _fetch_address_utxos_status(entry["address"], network)
+        if isinstance(_ret, tuple) and len(_ret) == 3:
+            utxos_raw, ok, prov = _ret
+        elif isinstance(_ret, tuple) and len(_ret) == 2:
+            utxos_raw, ok = _ret
+            prov = None
+        else:
+            utxos_raw, ok, prov = [], False, None
+        if not ok:
+            network_errors += 1
+        if ok and prov:
+            providers_used.append(prov)
+        for utxo in utxos_raw:
+            all_utxos.append(_normalize_utxo_result(entry, utxo))
+    return all_utxos, network_errors, providers_used
+
+
+def _max_utxo_index(utxos: List[Dict[str, Any]], change: bool) -> Optional[int]:
+    """Return the highest derivation index that currently holds a UTXO."""
+    indexes = [u.get("index") for u in utxos if bool(u.get("change")) is change]
+    if not indexes:
+        return None
+    return max(int(i) for i in indexes if isinstance(i, int))
+
+
+def _discover_wallet_utxos(xpub: str, network: str) -> Dict[str, Any]:
+    """Discover wallet UTXOs with bounded adaptive scanning.
+
+    Start with the configured scan window and extend only when the wallet appears to touch
+    the current edge, or when an empty healthy scan suggests the initial window is too small.
+    """
+    scan_receive = _get_scan_limit("BITCOIN_SCAN_RECEIVE", DEFAULT_SCAN_RECEIVE)
+    scan_change = _get_scan_limit("BITCOIN_SCAN_CHANGE", DEFAULT_SCAN_CHANGE)
+
+    max_receive = max(scan_receive, MAX_SCAN_RECEIVE)
+    max_change = max(scan_change, MAX_SCAN_CHANGE)
+
+    address_entries = _enumerate_addresses(xpub, network, scan_receive, scan_change)
+    all_utxos, network_errors, providers_used = _scan_address_entries(address_entries, network)
+    attempted_extended = False
+    scanned_keys = {(entry["change"], entry["index"]) for entry in address_entries}
+
+    while True:
+        next_receive = scan_receive
+        next_change = scan_change
+
+        if not all_utxos and network_errors == 0:
+            next_receive = min(max_receive, max(scan_receive, AUTO_EXTEND_EMPTY_RECEIVE))
+            next_change = min(max_change, max(scan_change, AUTO_EXTEND_EMPTY_CHANGE))
+
+        max_receive_index = _max_utxo_index(all_utxos, change=False)
+        max_change_index = _max_utxo_index(all_utxos, change=True)
+
+        if (
+            max_receive_index is not None
+            and max_receive_index >= scan_receive - SCAN_EDGE_BUFFER
+            and scan_receive < max_receive
+        ):
+            next_receive = min(
+                max_receive,
+                max(next_receive, max(scan_receive * 2, max_receive_index + SCAN_EDGE_BUFFER + 1)),
+            )
+
+        if (
+            max_change_index is not None
+            and max_change_index >= scan_change - SCAN_EDGE_BUFFER
+            and scan_change < max_change
+        ):
+            next_change = min(
+                max_change,
+                max(next_change, max(scan_change * 2, max_change_index + SCAN_EDGE_BUFFER + 1)),
+            )
+
+        if next_receive == scan_receive and next_change == scan_change:
+            break
+
+        attempted_extended = True
+        full_entries = _enumerate_addresses(xpub, network, next_receive, next_change)
+        extra_entries = [
+            entry for entry in full_entries
+            if (entry["change"], entry["index"]) not in scanned_keys
+        ]
+        if not extra_entries:
+            address_entries = full_entries
+            scan_receive = next_receive
+            scan_change = next_change
+            break
+
+        extra_utxos, extra_errors, extra_providers = _scan_address_entries(extra_entries, network)
+        address_entries = full_entries
+        scanned_keys.update((entry["change"], entry["index"]) for entry in extra_entries)
+        scan_receive = next_receive
+        scan_change = next_change
+        all_utxos.extend(extra_utxos)
+        network_errors += extra_errors
+        providers_used.extend(extra_providers)
+
+    all_utxos.sort(key=lambda u: (bool(u.get("change")), int(u.get("index", 0)), u.get("txid", ""), int(u.get("vout", 0))))
+    return {
+        "address_entries": address_entries,
+        "utxos": all_utxos,
+        "network_errors": network_errors,
+        "providers_used": list(sorted(set(providers_used))) if providers_used else [],
+        "scan_receive": scan_receive,
+        "scan_change": scan_change,
+        "attempted_extended": attempted_extended,
+    }
+
+
 
 
 
@@ -725,24 +1042,9 @@ def get_balance(xpub: str, network: str = "testnet") -> Dict:
     Obté el balanç d'una wallet Bitcoin desde la XPUB.
     """
     try:
-        # Reuse the exact same enumeration & fetching strategy as list_utxos to avoid discrepancies.
-        scan_receive = 10
-        scan_change = 5
-        addresses = _enumerate_addresses(xpub, network, scan_receive, scan_change)
-        utxos: List[Dict] = []
-        for entry in addresses:
-            for utxo in _fetch_address_utxos(entry["address"], network):
-                utxos.append({
-                    "txid": utxo.get("txid", ""),
-                    "vout": utxo.get("vout", 0),
-                    "value_satoshis": utxo.get("value", 0),
-                    "value_btc": utxo.get("value", 0) / 100_000_000,
-                    "address": entry["address"],
-                    "path": entry["path"],
-                    "index": entry["index"],
-                    "change": entry["change"],
-                    "confirmations": utxo.get("status", {}).get("confirmations", 0),
-                })
+        discovery = _discover_wallet_utxos(xpub, network)
+        addresses = discovery["address_entries"]
+        utxos = discovery["utxos"]
         total_balance = sum(u["value_satoshis"] for u in utxos)
         btc_balance = total_balance / 100_000_000
         coin_type = "1'" if network == "testnet" else "0'"
@@ -754,6 +1056,8 @@ def get_balance(xpub: str, network: str = "testnet") -> Dict:
             "utxos": utxos,
             "addresses": addresses,
             "addresses_checked": len(addresses),
+            "receive_addresses_checked": discovery["scan_receive"],
+            "change_addresses_checked": discovery["scan_change"],
             "network": network,
             "coin_type": coin_type,
             "derivation_paths": [a["path"] for a in addresses],
@@ -866,80 +1170,14 @@ def list_utxos(xpub: str, network: str = "testnet") -> Dict:
     Llista totes les UTXOs (Unspent Transaction Outputs) disponibles.
     """
     try:
-        # Allow environment overrides for scan limits to accommodate wallets with larger gaps
-        try:
-            scan_receive = int(os.getenv("BITCOIN_SCAN_RECEIVE", "10"))
-        except Exception:
-            scan_receive = 10
-        try:
-            scan_change = int(os.getenv("BITCOIN_SCAN_CHANGE", "5"))
-        except Exception:
-            scan_change = 5
-        address_entries = _enumerate_addresses(xpub, network, scan_receive, scan_change)
-
-        all_utxos: List[Dict] = []
-        network_errors = 0
-        providers_used: List[str] = []
-        for entry in address_entries:
-            _ret = _fetch_address_utxos_status(entry["address"], network)
-            # Back-compat: allow tests to monkeypatch a 2-tuple (utxos, ok)
-            if isinstance(_ret, tuple) and len(_ret) == 3:
-                utxos_raw, ok, prov = _ret
-            elif isinstance(_ret, tuple) and len(_ret) == 2:
-                utxos_raw, ok = _ret
-                prov = None
-            else:
-                utxos_raw, ok, prov = [], False, None
-            if not ok:
-                network_errors += 1
-            if ok and prov:
-                providers_used.append(prov)
-            for utxo in utxos_raw:
-                all_utxos.append({
-                    "txid": utxo.get("txid", ""),
-                    "vout": utxo.get("vout", 0),
-                    "value_satoshis": utxo.get("value", 0),
-                    "value_btc": utxo.get("value", 0) / 100_000_000,
-                    "address": entry["address"],
-                    "path": entry["path"],
-                    "index": entry["index"],
-                    "change": entry["change"],
-                    "confirmations": utxo.get("status", {}).get("confirmations", 0),
-                })
-
-        # If we found nothing and the network appeared healthy, attempt an extended scan once
-        attempted_extended = False
-        if not all_utxos and network_errors == 0:
-            attempted_extended = True
-            ext_receive = max(scan_receive, 50)
-            ext_change = max(scan_change, 20)
-            # Enumerate only the additional range beyond the original
-            extra_addrs = _enumerate_addresses(xpub, network, ext_receive, ext_change)[len(address_entries):]
-            for entry in extra_addrs:
-                _ret = _fetch_address_utxos_status(entry["address"], network)
-                if isinstance(_ret, tuple) and len(_ret) == 3:
-                    utxos_raw, ok, prov = _ret
-                elif isinstance(_ret, tuple) and len(_ret) == 2:
-                    utxos_raw, ok = _ret
-                    prov = None
-                else:
-                    utxos_raw, ok, prov = [], False, None
-                if not ok:
-                    network_errors += 1  # count failures even in extended scan
-                if ok and prov:
-                    providers_used.append(prov)
-                for utxo in utxos_raw:
-                    all_utxos.append({
-                        "txid": utxo.get("txid", ""),
-                        "vout": utxo.get("vout", 0),
-                        "value_satoshis": utxo.get("value", 0),
-                        "value_btc": utxo.get("value", 0) / 100_000_000,
-                        "address": entry["address"],
-                        "path": entry["path"],
-                        "index": entry["index"],
-                        "change": entry["change"],
-                        "confirmations": utxo.get("status", {}).get("confirmations", 0),
-                    })
+        discovery = _discover_wallet_utxos(xpub, network)
+        address_entries = discovery["address_entries"]
+        all_utxos = discovery["utxos"]
+        network_errors = discovery["network_errors"]
+        providers_used = discovery["providers_used"]
+        scan_receive = discovery["scan_receive"]
+        scan_change = discovery["scan_change"]
+        attempted_extended = discovery["attempted_extended"]
 
         total_value_sat = sum(u["value_satoshis"] for u in all_utxos)
         result = {
@@ -1551,6 +1789,7 @@ class BitcoinAIAgent:
         self.xpub = None
         self.network = "testnet"
         self.last_psbt = None  # Guardar l'últim PSBT creat
+        self.last_tool_trace: List[Dict[str, Any]] = []
     
     def _build_graph(self):
         """Construeix el graf de LangGraph"""
@@ -1641,6 +1880,12 @@ PROHIBIT:
                     logger.debug("Tool calls: %d", len(response.tool_calls))
                     for tc in response.tool_calls:
                         logger.debug("  - %s: %s", tc['name'], tc['args'])
+                        self.last_tool_trace.append({
+                            "event": "tool_call",
+                            "name": tc.get("name"),
+                            "tool_call_id": tc.get("id"),
+                            "args": tc.get("args"),
+                        })
                         
                         # Track PSBT creation
                         if tc['name'] == 'create_transaction':
@@ -1695,6 +1940,7 @@ PROHIBIT:
         """Processa un missatge de l'usuari"""
         global _LAST_USER_UTTERANCE
         _LAST_USER_UTTERANCE = message
+        self.last_tool_trace = []
         lower = message.lower().strip()
         # Heurística per detectar directiva (imperativa) i guardar-la
         directive_prefixes = [
@@ -1778,6 +2024,12 @@ PROHIBIT:
                         logger.debug("ToolMessage content preview: %s", preview)
                     except Exception:
                         pass
+                    self.last_tool_trace.append({
+                        "event": "tool_result",
+                        "name": getattr(msg, "name", None),
+                        "tool_call_id": getattr(msg, "tool_call_id", None),
+                        "summary": _summarize_tool_result_content(msg.content),
+                    })
                     # Look for PSBT in response
                     try:
                         # Normalitza contingut de ToolMessage (pot ser str JSON, dict o llista segmentada)
@@ -1857,6 +2109,12 @@ PROHIBIT:
                     elif not hasattr(msg, "tool_calls"):
                         final_response = _extract_text_content(msg.content)
                         break
+
+            if final_response is not None:
+                self.last_tool_trace.append({
+                    "event": "final_response",
+                    "preview": _preview_text(final_response, limit=800),
+                })
 
             # Update memory with messages from graph
             if self._memory_enabled:

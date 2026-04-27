@@ -58,11 +58,14 @@ print(info["address"], info["path"])  # e.g. tb1q...
 - Change chain: `change=True` → m/84'/1'/0'/1/i (testnet).
 
 ### UTXO Listing (agent tool)
-Lists first N receive + change addresses; aggregates UTXOs.
+Starts from the configured receive/change window, then expands adaptively if activity is found near the current scan edge. This avoids truncating wallets that have live UTXOs beyond the first few derived indices while keeping small-wallet scans fast.
 ```
 from bitcoin_ai_agent import list_utxos
 res = list_utxos.invoke({"xpub": XPUB, "network": "testnet"})
 ```
+- Initial scan window defaults to `BITCOIN_SCAN_RECEIVE=10` and `BITCOIN_SCAN_CHANGE=5`.
+- If the wallet touches that boundary, the agent extends the scan automatically up to a bounded maximum.
+- When using Bitcoin Core, the agent batches each scan round into a single `scantxoutset` call.
 
 ### PSBT Creation
 ```

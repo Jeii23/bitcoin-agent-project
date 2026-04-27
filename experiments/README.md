@@ -135,6 +135,32 @@ Main UI capabilities:
 
 The UI is optional. Any experiment created by the UI is still represented as a CSV row and can be run from the CLI.
 
+## Active 2026 Matrix
+
+The active `experiments.csv` is now the cleaned 2026 batch:
+
+- `100` enabled Phase 1 screening rows:
+  5 active models x 2 prompt strategies (`basic`, `privacy-simple`) x 5 amount targets (`10%`, `30%`, `50%`, `80%`, `95%`) x 2 temperatures (`0.3`, `1.0`)
+- `40` disabled deferred Phase 1 frontier rows:
+  2 high-cost frontier models kept in place for later reactivation, with the same prompts, IDs, and tags preserved
+- `40` disabled Phase 2 challenge rows:
+  4 pre-created finalist lanes x `multiturn-detailed` x the same 5 amount targets x the same 2 temperatures
+- total CSV rows remain `180`
+- `repetitions=1` for Phase 1 and `repetitions=2` for Phase 2
+
+The historical paper matrix is preserved at:
+
+```text
+experiments_paper_legacy.csv
+```
+
+Important batch-specific notes:
+
+- Google-family models in the active matrix run through `openrouter`, not the direct `google` provider lane.
+- `OPENROUTER_API_KEY` is therefore required for both `google/gemini-3.1-pro-preview` and `google/gemma-4-31b-it`.
+- Amount targets are encoded in prompt text and normalized tags such as `amt-pct-50`; the runner contract is unchanged.
+- The UI shows these rows as prompt-defined amount targets instead of pretending they are fixed BTC amounts.
+
 ## CSV Format
 
 The legacy runner fields remain the stable execution contract:
@@ -166,7 +192,7 @@ The UI may add optional columns while preserving old rows:
 | `priority` | Optional ordering field |
 | `xpub` | Optional xpub override; empty means use `.env` |
 
-Legacy rows without `amount_btc`, `strategy`, or `prompt_mode` still work. The UI infers display values from tags and prompt text, but preserves manual prompt text unless template regeneration is explicitly used.
+Legacy rows without `amount_btc`, `strategy`, or `prompt_mode` still work. The active 2026 matrix intentionally uses only the stable runner columns plus normalized tags, so the UI infers amount targets and strategy from prompt text and tags while preserving manual prompt text.
 
 ## Prompt Strategies
 
@@ -180,7 +206,13 @@ Legacy rows without `amount_btc`, `strategy`, or `prompt_mode` still work. The U
 | `multiturn-detailed` | Basic request followed by detailed privacy instructions |
 | `privacy-detailed` | One-shot request with detailed privacy instructions |
 
-Historically, amount and privacy wording were embedded directly inside `user_prompt`. The structured fields make sweeps easier while keeping the generated prompt text visible and reproducible.
+The active 2026 matrix uses only three of those strategies:
+
+- `basic`
+- `privacy-simple`
+- `multiturn-detailed`
+
+Historically, amount and privacy wording were embedded directly inside `user_prompt`. The template helpers still support structured ad hoc experiments in the UI, but the active 2026 batch keeps amount semantics in prompt text plus tags to avoid changing the runner contract.
 
 ## Scoring
 
@@ -215,7 +247,7 @@ results/experiments_YYYYMMDD_HHMMSS.csv
 results/experiments_YYYYMMDD_HHMMSS.json
 ```
 
-The CSV is the compact summary. The JSON keeps detailed scorer breakdowns, agent responses, and PSBT metadata when available. Binary and Base64 PSBTs are saved under:
+The runner creates that pair for the batch and rewrites it incrementally after each completed run, so the Streamlit Results view can inspect a live batch while it is still executing. The CSV is the compact summary. The JSON keeps detailed scorer breakdowns, agent responses, and PSBT metadata when available. Binary and Base64 PSBTs are saved under:
 
 ```text
 results/psbts/
@@ -230,7 +262,9 @@ From the project root:
 ```bash
 # CSV parsing and runner wiring
 cd experiments
-python experiment_runner.py experiments.csv --dry-run --filter id:exp_openai_basic
+python experiment_runner.py experiments.csv --dry-run --filter id:exp_openai_gpt54_basic_pct10_t03
+python experiment_runner.py experiments.csv --dry-run --filter id:exp_anthropic_opus47_basic_pct10_t03
+python experiment_runner.py experiments.csv --dry-run --filter id:exp_openrouter_gemini31pro_basic_pct10_t03
 
 # Syntax check
 cd ..
@@ -242,8 +276,16 @@ pytest -q tests/test_experiment_web_integration.py
 
 The dry-run does not call LLM APIs. Running real experiments may use API credits and can take several minutes per experiment.
 
+Before launching the full Phase 1 batch, the intended workflow is:
+
+1. Dry-run one representative row per provider lane.
+2. Run one paid smoke test per selected model, preferably the `basic`, `10%`, `T0.3` row.
+3. Only then launch the full enabled Phase 1 screening matrix.
+
 ## Research Notes
 
 This experiment system is designed to preserve backward compatibility with the CSV + runner workflow while adding structured controls for new research variables. The important current limitation is that some research factors are still encoded in natural language prompts. The UI and prompt templates make amount and prompt strategy first-class without forcing a breaking schema migration.
 
 The intended use is iterative local experimentation: define rows, run selected experiments, inspect generated PSBTs and scoring output, and compare how model and prompt choices affect privacy and fee sanity.
+
+One known risk in the current 2026 batch is the `google/gemini-3.1-pro-preview` OpenRouter lane under `multiturn-detailed`: OpenRouter documents extra care around multi-turn reasoning/tool state, and the current runner does not explicitly preserve Gemini `reasoning_details`. Treat the disabled Phase 2 Gemini rows as opt-in until smoke-tested successfully.

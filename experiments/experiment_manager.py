@@ -104,6 +104,25 @@ class ExperimentManager:
             return default
 
     @classmethod
+    def infer_amount_percent(cls, row: Dict) -> Optional[str]:
+        """Infer a wallet-balance percentage target from tags or prompt text."""
+        tags = {tag.lower() for tag in cls._split_pipe(row.get("tags", ""))}
+        for tag in tags:
+            match = re.fullmatch(r"amt-pct-([0-9]+(?:\.[0-9]+)?)", tag)
+            if match:
+                return match.group(1)
+
+        prompt_text = " ".join([
+            row.get("user_prompt", ""),
+            row.get("followup_prompts", ""),
+        ])
+        match = re.search(r"\b([0-9]+(?:\.[0-9]+)?)\s*%", prompt_text)
+        if match:
+            return match.group(1)
+
+        return None
+
+    @classmethod
     def infer_amount_btc(cls, row: Dict) -> float:
         """Infer amount from explicit CSV field or legacy Catalan prompt text."""
         explicit = row.get("amount_btc")
@@ -127,6 +146,20 @@ class ExperimentManager:
         return 3.0
 
     @classmethod
+    def infer_amount_display(cls, row: Dict) -> str:
+        """Infer a researcher-friendly amount label for UI tables."""
+        percent = cls.infer_amount_percent(row)
+        if percent is not None:
+            return f"{percent}% of wallet balance"
+
+        amount_btc = cls.infer_amount_btc(row)
+        if amount_btc >= 1:
+            return f"{amount_btc:g} BTC"
+
+        satoshis = int(amount_btc * 100_000_000)
+        return f"{satoshis} satoshis (≈ {amount_btc:.6f} BTC)"
+
+    @classmethod
     def infer_strategy(cls, row: Dict) -> str:
         """Infer prompt strategy for legacy rows without changing their prompt text."""
         explicit = (row.get("strategy") or "").strip()
@@ -138,6 +171,16 @@ class ExperimentManager:
         followups = cls._split_pipe(row.get("followup_prompts", ""))
         text = cls._strip_accents(" ".join([row.get("user_prompt", "")] + followups))
 
+        if "prompt-basic" in tags:
+            return PromptStrategy.BASIC.value
+        if "prompt-privacy-simple" in tags:
+            return PromptStrategy.PRIVACY_SIMPLE.value
+        if "prompt-multiturn-detailed" in tags:
+            return PromptStrategy.MULTITURN_DETAILED.value
+        if "prompt-multiturn-simple" in tags:
+            return PromptStrategy.MULTITURN_SIMPLE.value
+        if "prompt-privacy-detailed" in tags:
+            return PromptStrategy.PRIVACY_DETAILED.value
         if "privacy-simple" in tags:
             return PromptStrategy.PRIVACY_SIMPLE.value
         if "multi-turn" in tags and "privacy-detailed" in tags:

@@ -141,3 +141,8 @@ def test_agent_emits_single_line_psbt_and_files(tmp_path, monkeypatch):
     assert "\n" not in saved_b64 and saved_b64.startswith("cHNidP")
     saved_raw = Path("psbt_latest.psbt").read_bytes()
     assert saved_raw.startswith(b"psbt\xff")
+
+    trace = agent.last_tool_trace
+    assert any(event.get("event") == "tool_call" and event.get("name") == "create_transaction_manual" for event in trace)
+    assert any(event.get("event") == "tool_result" for event in trace)
+    assert any(event.get("event") == "final_response" for event in trace)

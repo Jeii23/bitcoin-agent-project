@@ -14,6 +14,7 @@ import pandas as pd
 import subprocess
 import logging
 import sys
+import re
 from pathlib import Path
 from typing import List, Dict, Optional
 
@@ -73,6 +74,9 @@ def show_pdf_preview(pdf_path: Path, *, height: int = 720):
     st.iframe(pdf_path, width="stretch", height=height)
 
 
+_RESULT_FILE_RE = re.compile(r"experiments_(\d{8}_\d{6})\.csv$")
+
+
 def load_css():
     """Load custom CSS for better styling."""
     st.markdown("""
@@ -128,6 +132,38 @@ def safe_prompt_mode(manager: ExperimentManager, exp: Dict, meta: ExperimentMeta
     if raw in PROMPT_MODE_OPTIONS:
         return raw
     return "template" if exp.get("amount_btc") or exp.get("strategy") else "custom"
+
+
+def sort_results_for_display(df: pd.DataFrame) -> pd.DataFrame:
+    """Show the newest completed runs first, even when multiple files are loaded."""
+    if df is None or df.empty:
+        return df
+
+    sorted_df = df.copy()
+    sort_columns = []
+    ascending = []
+
+    if "timestamp" in sorted_df.columns:
+        sorted_df["_sort_timestamp"] = pd.to_datetime(sorted_df["timestamp"], errors="coerce")
+        sort_columns.append("_sort_timestamp")
+        ascending.append(False)
+    if "source_file" in sorted_df.columns:
+        sort_columns.append("source_file")
+        ascending.append(False)
+    if "repetition" in sorted_df.columns:
+        sort_columns.append("repetition")
+        ascending.append(False)
+
+    if not sort_columns:
+        return sorted_df
+
+    sorted_df = sorted_df.sort_values(
+        by=sort_columns,
+        ascending=ascending,
+        kind="stable",
+        na_position="last",
+    )
+    return sorted_df.drop(columns=["_sort_timestamp"], errors="ignore")
 
 
 def all_tags_from_dataframe(exp_df: pd.DataFrame) -> List[str]:
@@ -218,6 +254,7 @@ def experiments_dataframe(manager: ExperimentManager, experiments: List[Dict]) -
             "provider": meta.provider,
             "model": meta.model,
             "strategy": meta.strategy,
+            "amount_display": manager.infer_amount_display(exp),
             "amount_btc": meta.amount_btc,
             "prompt_mode": prompt_mode,
             "temperature": meta.temperature,
@@ -268,11 +305,30 @@ def run_runner_command(cmd: List[str], timeout_seconds: Optional[int] = None) ->
 
 
 def load_result_files() -> List[Path]:
-    """Get list of result CSV/JSON files."""
+    """Get result CSV files from results/ and its named subdirectories."""
     if not RESULTS_DIR.exists():
         return []
-    csv_files = sorted(RESULTS_DIR.glob("experiments_*.csv"))
-    return csv_files
+
+    def sort_key(path: Path):
+        match = _RESULT_FILE_RE.search(path.name)
+        timestamp = match.group(1) if match else ""
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            mtime = 0
+        relative = path.relative_to(RESULTS_DIR)
+        return (timestamp, mtime, str(relative))
+
+    csv_files = [path for path in RESULTS_DIR.rglob("experiments_*.csv") if path.is_file()]
+    return sorted(csv_files, key=sort_key)
+
+
+def format_result_path(path: Path) -> str:
+    """Return a readable path label relative to experiments/results."""
+    try:
+        return str(path.relative_to(RESULTS_DIR))
+    except ValueError:
+        return path.name
 
 
 def load_latest_results(manager: ExperimentManager) -> Optional[pd.DataFrame]:
@@ -312,7 +368,7 @@ def choose_results_dataframe(
             "Result files",
             result_files,
             default=[result_files[-1]],
-            format_func=lambda p: p.name,
+            format_func=format_result_path,
             key=f"{key_prefix}_result_files",
         )
 
@@ -483,7 +539,7 @@ def show_dashboard(manager: ExperimentManager):
     st.subheader("📋 Recent Experiments (First 10)")
     if not exp_df.empty:
         df = exp_df.head(10)
-        display_cols = ['id', 'name', 'provider', 'model', 'strategy', 'amount_btc', 'enabled']
+        display_cols = ['id', 'name', 'provider', 'model', 'strategy', 'amount_display', 'enabled']
         df_display = df[[c for c in display_cols if c in df.columns]]
         show_dataframe(df_display, width='stretch')
 
@@ -492,6 +548,7 @@ def show_dashboard(manager: ExperimentManager):
     results_df = load_latest_results(manager)
     if results_df is not None:
         st.write(f"**Loaded from**: {load_result_files()[-1].name if load_result_files() else 'N/A'}")
+        st.caption(f"Path: {format_result_path(load_result_files()[-1])}" if load_result_files() else "")
 
         # Summary stats
         col1, col2, col3 = st.columns(3)
@@ -555,7 +612,7 @@ def show_experiments_browser(manager: ExperimentManager):
     if not filtered_df.empty:
         df = filtered_df
         display_cols = [
-            'id', 'name', 'provider', 'model', 'strategy', 'amount_btc',
+            'id', 'name', 'provider', 'model', 'strategy', 'amount_display',
             'prompt_mode', 'temperature', 'repetitions', 'enabled'
         ]
         df_display = df[[c for c in display_cols if c in df.columns]]
@@ -576,7 +633,7 @@ def show_experiments_browser(manager: ExperimentManager):
                     st.write(f"**Provider**: {meta.provider}")
                     st.write(f"**Model**: {meta.model}")
                     st.write(f"**Strategy**: {meta.strategy}")
-                    st.write(f"**Amount (BTC)**: {meta.amount_btc:g}")
+                    st.write(f"**Amount target**: {manager.infer_amount_display(exp)}")
 
                 with col2:
                     st.write(f"**Prompt mode**: {prompt_mode}")
@@ -929,13 +986,18 @@ def show_run_experiments(manager: ExperimentManager):
 
     amount_range = None
     amount_values = pd.to_numeric(exp_df["amount_btc"], errors="coerce").dropna()
-    if not amount_values.empty and amount_values.min() < amount_values.max():
+    amount_labels = exp_df.get("amount_display", pd.Series(dtype="object")).dropna().astype(str)
+    relative_targets = amount_labels.str.contains("%", regex=False).any()
+    if not amount_values.empty and amount_values.min() < amount_values.max() and not relative_targets:
         amount_range = st.slider(
             "Amount range (BTC)",
             min_value=float(amount_values.min()),
             max_value=float(amount_values.max()),
             value=(float(amount_values.min()), float(amount_values.max())),
         )
+    elif relative_targets:
+        unique_targets = ", ".join(dict.fromkeys(amount_labels.tolist()))
+        st.caption(f"Amount filter not shown: current rows use prompt-defined percentage targets ({unique_targets}).")
     elif not amount_values.empty:
         st.caption(f"Amount filter not shown: all visible experiments infer {amount_values.iloc[0]:g} BTC.")
 
@@ -955,7 +1017,7 @@ def show_run_experiments(manager: ExperimentManager):
 
     st.subheader(f"Matching Experiments: {len(filtered_df)}")
     preview_cols = [
-        "id", "name", "provider", "model", "strategy", "amount_btc",
+        "id", "name", "provider", "model", "strategy", "amount_display",
         "prompt_mode", "network", "enabled", "tags",
     ]
     show_dataframe(filtered_df[[c for c in preview_cols if c in filtered_df.columns]], width='stretch')
@@ -1067,11 +1129,13 @@ def show_results(manager: ExperimentManager):
     results_df, selected_files = choose_results_dataframe(
         manager,
         key_prefix="results",
-        default_scope="All result files",
+        default_scope="Latest result file",
     )
     if results_df is None or results_df.empty:
         st.info("No rows found in the selected result files.")
         return
+
+    results_df = sort_results_for_display(results_df)
 
     col1, col2 = st.columns([3, 1])
     with col1:
@@ -1079,10 +1143,12 @@ def show_results(manager: ExperimentManager):
         st.caption(f"{len(results_df)} result rows loaded.")
         with st.expander("Loaded result files"):
             for path in selected_files:
-                st.code(path.name)
+                st.code(format_result_path(path))
     with col2:
         if st.button("🔄 Reload"):
             st.rerun()
+
+    st.caption("The latest result file is updated after each completed run. Use Reload to pick up new rows from an in-progress batch.")
 
     # Summary stats
     st.subheader("Summary Statistics")
@@ -1145,6 +1211,7 @@ def show_results(manager: ExperimentManager):
     if sanity_filter and 'sanity_status' in filtered_df.columns:
         filtered_df = filtered_df[filtered_df['sanity_status'].isin(sanity_filter)]
 
+    filtered_df = sort_results_for_display(filtered_df)
     show_dataframe(filtered_df[display_columns(filtered_df.columns)], width='stretch')
 
     # Charts
@@ -1192,7 +1259,7 @@ def show_compare_results(manager: ExperimentManager):
 
     comparison_type = st.selectbox(
         "Compare by",
-        ["Model", "Strategy", "Provider", "Amount (BTC)"]
+        ["Model", "Strategy", "Provider", "Amount Target", "Amount (BTC)"]
     )
 
     if comparison_type == "Model" and 'llm_model' in results_df.columns:
@@ -1201,6 +1268,8 @@ def show_compare_results(manager: ExperimentManager):
         by_col = 'strategy'
     elif comparison_type == "Provider" and 'llm_provider' in results_df.columns:
         by_col = 'llm_provider'
+    elif comparison_type == "Amount Target" and 'amount_display' in results_df.columns:
+        by_col = 'amount_display'
     elif comparison_type == "Amount (BTC)" and 'amount_btc' in results_df.columns:
         by_col = 'amount_btc'
     else:

@@ -177,6 +177,7 @@ class ExperimentResult:
     
     # Agent response (for debugging)
     agent_response: Optional[str] = None
+    tool_trace: Optional[List[Dict[str, Any]]] = None
     
     # Tags for analysis
     tags: List[str] = field(default_factory=list)
@@ -281,6 +282,9 @@ class ExperimentRunner:
         self.results: List[ExperimentResult] = []
         self._agent_class = None
         self._privacy_scorer_class = None
+        self._run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self._json_path = self.output_dir / f"experiments_{self._run_timestamp}.json"
+        self._csv_path = self.output_dir / f"experiments_{self._run_timestamp}.csv"
     
     def _lazy_import_agent(self):
         """Lazy import of BitcoinAIAgent to avoid import at module level."""
@@ -304,6 +308,7 @@ class ExperimentRunner:
         """Run a single experiment with retry logic for transient errors."""
         start_time = datetime.now()
         timestamp = start_time.strftime("%Y-%m-%d %H:%M:%S")
+        agent = None
         
         logger.info(f"Running experiment: {exp.id} (rep {repetition}/{exp.settings.repetitions})")
         logger.info(f"  LLM: {exp.llm.provider}/{exp.llm.model} @ temp={exp.llm.temperature}")
@@ -373,6 +378,7 @@ class ExperimentRunner:
                     break  # Success, exit retry loop
                 except asyncio.TimeoutError:
                     result.error_message = f"Timeout after {exp.settings.timeout_seconds}s"
+                    result.tool_trace = getattr(agent, "last_tool_trace", None)
                     return result
                 except Exception as e:
                     error_str = str(e)
@@ -475,6 +481,8 @@ class ExperimentRunner:
             result.error_message = str(e)
         
         finally:
+            if agent is not None and result.tool_trace is None:
+                result.tool_trace = getattr(agent, "last_tool_trace", None)
             end_time = datetime.now()
             result.execution_time_seconds = (end_time - start_time).total_seconds()
         
@@ -496,6 +504,95 @@ class ExperimentRunner:
             return "E"
         else:
             return "F"
+
+    def _tmp_path_for(self, path: Path) -> Path:
+        """Return a stable temp path for atomic snapshot rewrites."""
+        return path.with_name(f".{path.name}.tmp")
+
+    def _csv_header(self) -> List[str]:
+        """Return the stable CSV schema used by the runner and web UI."""
+        return [
+            "experiment_id",
+            "experiment_name",
+            "repetition",
+            "timestamp",
+            "llm_provider",
+            "llm_model",
+            "llm_temperature",
+            "user_prompt",
+            "success",
+            "error_message",
+            "execution_time_seconds",
+            "psbt_generated",
+            "privacy_score",
+            "privacy_grade",
+            "psbt_file",
+            "fee_sanity_ok",
+            "sanity_status",
+            "fee_rate_sat_vb",
+            "fee_sats",
+            "tags",
+        ]
+
+    def _csv_row_for_result(self, result: ExperimentResult) -> List[Any]:
+        """Serialize one experiment result to the summary CSV row."""
+        privacy_breakdown = result.privacy_breakdown or {}
+        fee_analysis = privacy_breakdown.get("fee_analysis") or {}
+        fee_sanity_ok = privacy_breakdown.get("fee_sanity_ok", "")
+        sanity_status = privacy_breakdown.get("sanity_status", "")
+        fee_rate = fee_analysis.get("fee_rate_sat_vb", "")
+        fee_sats = fee_analysis.get("fee_sats", "")
+        return [
+            result.experiment_id,
+            result.experiment_name,
+            result.repetition,
+            result.timestamp,
+            result.llm_provider,
+            result.llm_model,
+            result.llm_temperature,
+            result.user_prompt[:100] + "..." if len(result.user_prompt) > 100 else result.user_prompt,
+            result.success,
+            result.error_message or "",
+            f"{result.execution_time_seconds:.2f}",
+            result.psbt_generated,
+            result.privacy_score if result.privacy_score is not None else "",
+            result.privacy_grade or "",
+            result.psbt_file or "",
+            fee_sanity_ok,
+            sanity_status,
+            fee_rate,
+            fee_sats,
+            ";".join(result.tags),
+        ]
+
+    def _persist_results_snapshot(self):
+        """Atomically rewrite the current JSON/CSV pair so the UI can inspect live runs."""
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+
+        json_tmp = self._tmp_path_for(self._json_path)
+        with open(json_tmp, "w", encoding="utf-8") as f:
+            json.dump(
+                [asdict(r) for r in self.results],
+                f,
+                indent=2,
+                ensure_ascii=False,
+                default=str,
+            )
+        json_tmp.replace(self._json_path)
+
+        csv_tmp = self._tmp_path_for(self._csv_path)
+        with open(csv_tmp, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(self._csv_header())
+            for result in self.results:
+                writer.writerow(self._csv_row_for_result(result))
+        csv_tmp.replace(self._csv_path)
+
+        logger.debug(
+            "Results snapshot updated: %s (%d rows)",
+            self._csv_path,
+            len(self.results),
+        )
     
     async def run_all(self, experiments: List[Experiment], filter_fn=None, interleave: bool = False, delay: float = 0) -> List[ExperimentResult]:
         """Run all experiments.
@@ -522,11 +619,16 @@ class ExperimentRunner:
             logger.info("Interleaving experiments by provider (round-robin)")
         
         logger.info(f"Running {len(active_experiments)} experiments...")
+
+        # Create the run-scoped result files immediately so the web UI can
+        # pick up an in-progress batch and then watch rows accumulate.
+        self._persist_results_snapshot()
         
         for i, exp in enumerate(active_experiments):
             for rep in range(1, exp.settings.repetitions + 1):
                 result = await self.run_experiment(exp, rep)
                 self.results.append(result)
+                self._persist_results_snapshot()
                 
                 # Add delay between experiments (helps with rate limits)
                 if delay > 0 and (i < len(active_experiments) - 1 or rep < exp.settings.repetitions):
@@ -561,81 +663,9 @@ class ExperimentRunner:
     
     def save_results(self):
         """Save results to CSV and JSON."""
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        
-        # Ensure output directory exists
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Save JSON (detailed)
-        json_path = self.output_dir / f"experiments_{timestamp}.json"
-        with open(json_path, "w", encoding="utf-8") as f:
-            json.dump(
-                [asdict(r) for r in self.results],
-                f,
-                indent=2,
-                ensure_ascii=False,
-                default=str,
-            )
-        logger.info(f"Detailed results saved to: {json_path}")
-        
-        # Save CSV (summary)
-        csv_path = self.output_dir / f"experiments_{timestamp}.csv"
-        with open(csv_path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            # Header
-            writer.writerow([
-                "experiment_id",
-                "experiment_name",
-                "repetition",
-                "timestamp",
-                "llm_provider",
-                "llm_model",
-                "llm_temperature",
-                "user_prompt",
-                "success",
-                "error_message",
-                "execution_time_seconds",
-                "psbt_generated",
-                "privacy_score",
-                "privacy_grade",
-                "psbt_file",
-                "fee_sanity_ok",
-                "sanity_status",
-                "fee_rate_sat_vb",
-                "fee_sats",
-                "tags",
-            ])
-            # Data rows
-            for r in self.results:
-                privacy_breakdown = r.privacy_breakdown or {}
-                fee_analysis = privacy_breakdown.get("fee_analysis") or {}
-                fee_sanity_ok = privacy_breakdown.get("fee_sanity_ok", "")
-                sanity_status = privacy_breakdown.get("sanity_status", "")
-                fee_rate = fee_analysis.get("fee_rate_sat_vb", "")
-                fee_sats = fee_analysis.get("fee_sats", "")
-                writer.writerow([
-                    r.experiment_id,
-                    r.experiment_name,
-                    r.repetition,
-                    r.timestamp,
-                    r.llm_provider,
-                    r.llm_model,
-                    r.llm_temperature,
-                    r.user_prompt[:100] + "..." if len(r.user_prompt) > 100 else r.user_prompt,
-                    r.success,
-                    r.error_message or "",
-                    f"{r.execution_time_seconds:.2f}",
-                    r.psbt_generated,
-                    r.privacy_score if r.privacy_score is not None else "",
-                    r.privacy_grade or "",
-                    r.psbt_file or "",
-                    fee_sanity_ok,
-                    sanity_status,
-                    fee_rate,
-                    fee_sats,
-                    ";".join(r.tags),
-                ])
-        logger.info(f"Summary CSV saved to: {csv_path}")
+        self._persist_results_snapshot()
+        logger.info(f"Detailed results saved to: {self._json_path}")
+        logger.info(f"Summary CSV saved to: {self._csv_path}")
         
         # Print summary
         self._print_summary()
