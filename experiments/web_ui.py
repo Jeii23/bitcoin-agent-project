@@ -8,7 +8,15 @@ Streamlit-based web interface for managing and running Bitcoin privacy experimen
 Usage:
     streamlit run web_ui.py
 """
-
+from wallet_baseline_results import (
+    EXPECTED_AMOUNT_PCTS,
+    WALLET_ORDER,
+    build_wallet_agent_amount_comparison,
+    build_wallet_coverage_matrix,
+    build_wallet_reliability_summary,
+    load_wallet_baseline_definitions,
+    select_latest_successful_by_wallet_amount,
+)
 import streamlit as st
 import pandas as pd
 import subprocess
@@ -32,15 +40,28 @@ from experiment_manager import ExperimentManager, ExperimentMeta, PromptStrategy
 from paper_charts import (
     ANALYSIS_CHARTS_DIR,
     PAPER_CHART_OPTIONS,
+    PHASE12_CHART_OPTIONS,
+    WALLET_BASELINE_CHART_OPTIONS,
     aggregate_current_results,
     build_paper_chart,
+    build_phase12_chart,
+    build_wallet_baseline_chart,
     current_results_v2_scores,
+    load_phase12_chart_dataframe,
+    load_wallet_baseline_chart_dataframe,
     load_paper_chart_sources,
     prepare_aggregated_dataframe,
     prepare_v2_scores_dataframe,
 )
 from prompt_templates import generate_prompts
 from result_utils import arrow_safe_dataframe, display_columns, load_many_results_dataframes, load_results_dataframe
+from wallet_baseline_results import (
+    build_wallet_agent_amount_comparison,
+    build_wallet_coverage_matrix,
+    build_wallet_reliability_summary,
+    load_wallet_baseline_definitions,
+    select_latest_successful_by_wallet_amount,
+)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -56,6 +77,8 @@ st.set_page_config(
 
 CSV_PATH = SCRIPT_DIR / "experiments.csv"
 RESULTS_DIR = SCRIPT_DIR / "results"
+PHASE12_FIGURES_DIR = SCRIPT_DIR.parent.parent / "paper" / "TFM" / "figures" / "phase12"
+WALLET_BASELINE_FIGURES_DIR = SCRIPT_DIR.parent.parent / "paper" / "TFM" / "figures" / "wallet_baseline"
 
 
 PROVIDER_OPTIONS = ["openai", "anthropic", "google", "openrouter"]
@@ -75,6 +98,10 @@ def show_dataframe(df: pd.DataFrame, **kwargs):
 
 def show_pdf_preview(pdf_path: Path, *, height: int = 720):
     """Embed a generated PDF chart in Streamlit."""
+    png_path = pdf_path.with_suffix(".png")
+    if png_path.exists():
+        st.image(str(png_path), width="stretch")
+        return
     st.iframe(pdf_path, width="stretch", height=height)
 
 
@@ -859,6 +886,238 @@ def show_paper_chart_gallery(
             show_dataframe(agg, width="stretch")
 
 
+def show_phase12_chart_gallery(key_prefix: str = "phase12_charts"):
+    """Show prompt-first research charts backed by the primary 2026 corpus."""
+    st.title("📊 2026 Prompt Strategy Charts")
+    st.caption(
+        "Uses the primary 2026 result corpus from `experiments/results/phase1` and "
+        "`experiments/results/phase2_all_phase1_models_20260427_rerun`. "
+        "Those folders are execution lots; the charts below treat prompt strategy as the main comparison axis."
+    )
+
+    try:
+        df = load_phase12_chart_dataframe()
+    except Exception as exc:
+        st.error(f"Could not load the 2026 prompt chart corpus: {exc}")
+        return
+
+    if df.empty:
+        st.info("No 2026 prompt-corpus result rows were found in the configured primary corpus.")
+        return
+
+    col1, col2, col3, col4 = st.columns(4)
+    fee_ok_count = int((df.get("fee_ok_bool", pd.Series(dtype=bool)) == True).sum())  # noqa: E712
+    psbt_count = int((df.get("psbt_generated_bool", pd.Series(dtype=bool)) == True).sum())  # noqa: E712
+    with col1:
+        st.metric("Rows", len(df))
+    with col2:
+        st.metric("Fee-sane PSBTs", fee_ok_count)
+    with col3:
+        st.metric("PSBTs generated", psbt_count)
+    with col4:
+        avg_score = pd.to_numeric(df.get("usable_score"), errors="coerce").mean()
+        st.metric("Avg fee-sane score", f"{avg_score:.1f}" if pd.notna(avg_score) else "N/A")
+
+    missing_price = df[df.get("cost_source", pd.Series(dtype=str)) == "missing-price"]
+    estimated_cost = df[df.get("cost_source", pd.Series(dtype=str)) == "estimated"]
+    if not estimated_cost.empty:
+        st.info(
+            "Cost charts are labelled as estimates for historical runs because token usage was not stored in those result files."
+        )
+    if not missing_price.empty:
+        st.warning(f"{len(missing_price)} row(s) have no local price entry and are omitted from cost charts.")
+
+    chart_name = st.selectbox(
+        "Prompt chart",
+        PHASE12_CHART_OPTIONS,
+        key=f"{key_prefix}_chart",
+    )
+    chart = build_phase12_chart(chart_name, df)
+    if chart is None:
+        st.info("This chart needs prompt, score, fee, or structure fields that are not available in the loaded corpus.")
+    else:
+        st.altair_chart(chart, width="content")
+
+    pdfs = sorted(PHASE12_FIGURES_DIR.glob("*.pdf")) if PHASE12_FIGURES_DIR.exists() else []
+    if (PHASE12_FIGURES_DIR / "phase12_prompt_delta.pdf").exists():
+        stale_pdf_names = {
+            "phase12_phase2_uplift.pdf",
+            "phase12_reliability_by_model.pdf",
+        }
+        pdfs = [path for path in pdfs if path.name not in stale_pdf_names]
+    if pdfs:
+        st.subheader("Paper Figure Preview")
+        selected_pdf = st.selectbox(
+            "Generated 2026 prompt PDF",
+            pdfs,
+            format_func=lambda p: p.name,
+            key=f"{key_prefix}_pdf_preview",
+        )
+        show_pdf_preview(selected_pdf)
+    else:
+        st.info(
+            "No generated 2026 prompt PDFs found yet. Run "
+            "`python analysis/charts/generate_phase12_academic_charts.py` to write paper figures."
+        )
+
+    with st.expander("Normalized 2026 prompt data"):
+        cols = [
+            "experiment_id",
+            "execution_lot_label",
+            "prompt_label",
+            "amount_pct",
+            "temperature",
+            "llm_model",
+            "privacy_score",
+            "fee_ok_bool",
+            "fee_rate_sat_vb",
+            "num_inputs",
+            "num_outputs",
+            "estimated_cost_usd",
+            "cost_source",
+        ]
+        show_dataframe(df[[col for col in cols if col in df.columns]], width="stretch")
+
+
+def show_wallet_baseline_gallery(key_prefix: str = "wallet_baselines"):
+    """Show real-wallet baseline results and comparisons against agents."""
+    st.title("Wallet Baselines")
+    st.caption(
+        "Compares real wallet coin selection against the canonical 2026 agent corpus. "
+        "Wallet rows stay separate from phase-1/phase-2 and are loaded from "
+        "`experiments/results/wallet_baseline_*`."
+    )
+
+    try:
+        df = load_wallet_baseline_chart_dataframe()
+        definitions = load_wallet_baseline_definitions()
+        coverage = build_wallet_coverage_matrix(df, definitions)
+    except Exception as exc:
+        st.error(f"Could not load wallet baseline data: {exc}")
+        return
+
+    latest = select_latest_successful_by_wallet_amount(df)
+    reliability = build_wallet_reliability_summary(df)
+    comparison = build_wallet_agent_amount_comparison(df)
+
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("Result rows", len(df))
+    with col2:
+        ok_cells = int((coverage.get("coverage_status", pd.Series(dtype=str)) == "ok").sum()) if not coverage.empty else 0
+        expected_cells = len(WALLET_ORDER) * len(EXPECTED_AMOUNT_PCTS)
+        st.metric("Fee-sane cells", f"{ok_cells}/{expected_cells}")
+    with col3:
+        wallets_done = latest["wallet"].nunique() if not latest.empty and "wallet" in latest.columns else 0
+        st.metric("Wallets with PSBTs", wallets_done)
+    with col4:
+        avg_score = pd.to_numeric(latest.get("usable_score", pd.Series(dtype=float)), errors="coerce").mean()
+        st.metric("Avg wallet score", f"{avg_score:.1f}" if pd.notna(avg_score) else "N/A")
+
+    if coverage.empty:
+        st.info("No wallet baseline definitions or results found yet.")
+    else:
+        waiting = coverage[
+            coverage["coverage_status"].isin(
+                [
+                    "waiting-for-manual-psbt",
+                    "prepared-via-rpc",
+                    "public-only-skeleton-generated",
+                    "unsupported-by-safe-rpc",
+                    "defined-disabled",
+                    "missing-result",
+                    "not-defined",
+                ]
+            )
+        ]
+        if not waiting.empty:
+            st.warning(
+                f"{len(waiting)} expected wallet/amount cell(s) are not complete yet. "
+                "Sparrow uses manual import; Wasabi needs PSBT workflow export from the public-only skeleton path."
+            )
+
+    chart_name = st.selectbox(
+        "Wallet chart",
+        WALLET_BASELINE_CHART_OPTIONS,
+        key=f"{key_prefix}_chart",
+    )
+    chart = build_wallet_baseline_chart(chart_name, df)
+    if chart is None:
+        st.info("This chart needs wallet PSBT, score, fee, structure, or agent-comparison data that is not available yet.")
+    else:
+        st.altair_chart(chart, width="content")
+
+    st.subheader("Coverage")
+    coverage_columns = [
+        "wallet_label",
+        "amount_label",
+        "status_label",
+        "privacy_score",
+        "fee_rate_sat_vb",
+        "fee_sats",
+        "num_inputs",
+        "num_outputs",
+        "wasabi_rpc_ok",
+        "wasabi_utxo_check_ok",
+        "wasabi_skeleton_source",
+        "run_id",
+        "psbt_file",
+    ]
+    show_dataframe(coverage[[col for col in coverage_columns if col in coverage.columns]], width="stretch")
+
+    if not comparison.empty:
+        st.subheader("Wallet vs Agent Corpus")
+        comparison_columns = [
+            "wallet_label",
+            "amount_label",
+            "privacy_score",
+            "agent_mean_privacy_score",
+            "wallet_minus_agent_mean",
+            "fee_sats",
+            "agent_median_fee_sats",
+            "fee_rate_sat_vb",
+            "agent_median_fee_rate_sat_vb",
+        ]
+        show_dataframe(comparison[[col for col in comparison_columns if col in comparison.columns]], width="stretch")
+    else:
+        st.info("Wallet-vs-agent comparison will appear once at least one wallet baseline PSBT has been scored.")
+
+    if not reliability.empty:
+        with st.expander("Reliability summary"):
+            show_dataframe(reliability, width="stretch")
+
+    with st.expander("Normalized wallet baseline rows"):
+        normalized_columns = [
+            "experiment_id",
+            "wallet_label",
+            "adapter",
+            "amount_label",
+            "success_bool",
+            "psbt_generated_bool",
+            "fee_ok_bool",
+            "privacy_score",
+            "fee_rate_sat_vb",
+            "fee_sats",
+            "num_inputs",
+            "num_outputs",
+            "error_message",
+            "run_id",
+            "psbt_file",
+        ]
+        show_dataframe(df[[col for col in normalized_columns if col in df.columns]], width="stretch")
+
+    pdfs = sorted(WALLET_BASELINE_FIGURES_DIR.glob("*.pdf")) if WALLET_BASELINE_FIGURES_DIR.exists() else []
+    if pdfs:
+        st.subheader("Paper Figure Preview")
+        selected_pdf = st.selectbox(
+            "Generated wallet baseline PDF",
+            pdfs,
+            format_func=lambda path: path.name,
+            key=f"{key_prefix}_pdf_preview",
+        )
+        show_pdf_preview(selected_pdf)
+
+
 def main():
     """Main Streamlit app."""
     load_css()
@@ -876,6 +1135,8 @@ def main():
             "▶️ Run Experiments",
             "📈 Results",
             "🔍 Compare Results",
+            "📊 2026 Prompt Charts",
+            "👛 Wallet Baselines",
         ],
     )
 
@@ -897,6 +1158,10 @@ def main():
         show_results(manager)
     elif page == "🔍 Compare Results":
         show_compare_results(manager)
+    elif page == "📊 2026 Prompt Charts":
+        show_phase12_chart_gallery()
+    elif page == "👛 Wallet Baselines":
+        show_wallet_baseline_gallery()
 
 
 def show_dashboard(manager: ExperimentManager):

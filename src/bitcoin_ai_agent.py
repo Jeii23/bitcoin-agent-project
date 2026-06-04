@@ -1788,7 +1788,86 @@ class BitcoinAIAgent:
         self.network = "testnet"
         self.last_psbt = None  # Guardar l'últim PSBT creat
         self.last_tool_trace: List[Dict[str, Any]] = []
+        self._token_usage: Dict[str, Any] = {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+            "events": [],
+        }
         self.write_latest_psbt_files = write_latest_psbt_files
+
+    def reset_token_usage(self) -> None:
+        """Reset accumulated LLM token usage for a fresh experiment run."""
+        self._token_usage = {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+            "events": [],
+        }
+
+    def get_token_usage(self) -> Dict[str, Any]:
+        """Return accumulated token usage captured from provider metadata."""
+        return {
+            "input_tokens": self._token_usage.get("input_tokens", 0),
+            "output_tokens": self._token_usage.get("output_tokens", 0),
+            "total_tokens": self._token_usage.get("total_tokens", 0),
+            "events": list(self._token_usage.get("events", [])),
+        }
+
+    @staticmethod
+    def _token_count_from(*sources: Any, keys: Sequence[str]) -> Optional[int]:
+        for source in sources:
+            if not isinstance(source, dict):
+                continue
+            for key in keys:
+                value = source.get(key)
+                if value is None or value == "":
+                    continue
+                try:
+                    return int(value)
+                except (TypeError, ValueError):
+                    continue
+        return None
+
+    def _record_llm_usage(self, response: BaseMessage) -> None:
+        """Accumulate token usage when LangChain exposes it on the response."""
+        usage_metadata = getattr(response, "usage_metadata", None) or {}
+        response_metadata = getattr(response, "response_metadata", None) or {}
+        token_usage = response_metadata.get("token_usage") or response_metadata.get("usage") or {}
+
+        input_tokens = self._token_count_from(
+            usage_metadata,
+            token_usage,
+            keys=("input_tokens", "prompt_tokens"),
+        )
+        output_tokens = self._token_count_from(
+            usage_metadata,
+            token_usage,
+            keys=("output_tokens", "completion_tokens"),
+        )
+        total_tokens = self._token_count_from(
+            usage_metadata,
+            token_usage,
+            keys=("total_tokens",),
+        )
+        if total_tokens is None and (input_tokens is not None or output_tokens is not None):
+            total_tokens = (input_tokens or 0) + (output_tokens or 0)
+
+        if input_tokens is None and output_tokens is None and total_tokens is None:
+            return
+
+        self._token_usage["input_tokens"] += input_tokens or 0
+        self._token_usage["output_tokens"] += output_tokens or 0
+        self._token_usage["total_tokens"] += total_tokens or 0
+        self._token_usage["events"].append(
+            {
+                "provider": self.llm_provider,
+                "model": self.llm_model,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "total_tokens": total_tokens,
+            }
+        )
     
     def _build_graph(self):
         """Construeix el graf de LangGraph"""
@@ -1874,6 +1953,7 @@ PROHIBIT:
         while retry_count <= max_retries:
             try:
                 response = self.llm.invoke(messages_for_llm)
+                self._record_llm_usage(response)
                 
                 if hasattr(response, "tool_calls") and response.tool_calls:
                     logger.debug("Tool calls: %d", len(response.tool_calls))

@@ -24,6 +24,10 @@ NUMERIC_COLUMNS = [
     "confidence_numeric",
     "num_inputs",
     "num_outputs",
+    "input_tokens",
+    "output_tokens",
+    "total_tokens",
+    "estimated_cost_usd",
 ]
 
 

@@ -50,6 +50,12 @@ PROJECT_DIR = SCRIPT_DIR.parent
 
 sys.path.insert(0, str(SRC_DIR))
 sys.path.insert(0, str(SCORING_DIR))
+sys.path.insert(0, str(SCRIPT_DIR))
+
+try:
+    from phase12_results import estimate_result_cost
+except ImportError:  # pragma: no cover - defensive fallback for legacy copies
+    estimate_result_cost = None
 
 # Load .env file before importing agent (which requires dotenv)
 try:
@@ -192,6 +198,13 @@ class ExperimentResult:
     # Agent response (for debugging)
     agent_response: Optional[str] = None
     tool_trace: Optional[List[Dict[str, Any]]] = None
+
+    # Optional token/cost accounting. Historical rows may leave these empty.
+    input_tokens: Optional[int] = None
+    output_tokens: Optional[int] = None
+    total_tokens: Optional[int] = None
+    estimated_cost_usd: Optional[float] = None
+    cost_source: Optional[str] = None
     
     # Tags for analysis
     tags: List[str] = field(default_factory=list)
@@ -442,6 +455,8 @@ class ExperimentRunner:
                 temperature=exp.llm.temperature,
                 write_latest_psbt_files=False,
             )
+            if hasattr(agent, "reset_token_usage"):
+                agent.reset_token_usage()
             
             # Configure wallet
             if exp.wallet.xpub:
@@ -610,6 +625,21 @@ class ExperimentRunner:
         finally:
             if agent is not None and result.tool_trace is None:
                 result.tool_trace = getattr(agent, "last_tool_trace", None)
+            if agent is not None and hasattr(agent, "get_token_usage"):
+                usage = agent.get_token_usage() or {}
+                result.input_tokens = usage.get("input_tokens") or None
+                result.output_tokens = usage.get("output_tokens") or None
+                result.total_tokens = usage.get("total_tokens") or None
+            if estimate_result_cost is not None:
+                cost = estimate_result_cost(
+                    model=exp.llm.model,
+                    provider=exp.llm.provider,
+                    tags=exp.tags,
+                    input_tokens=result.input_tokens,
+                    output_tokens=result.output_tokens,
+                )
+                result.estimated_cost_usd = cost.get("estimated_cost_usd")
+                result.cost_source = cost.get("cost_source")
             end_time = datetime.now()
             result.execution_time_seconds = (end_time - start_time).total_seconds()
         
@@ -659,6 +689,11 @@ class ExperimentRunner:
             "fee_rate_sat_vb",
             "fee_sats",
             "tags",
+            "input_tokens",
+            "output_tokens",
+            "total_tokens",
+            "estimated_cost_usd",
+            "cost_source",
         ]
 
     def _csv_row_for_result(self, result: ExperimentResult) -> List[Any]:
@@ -690,6 +725,11 @@ class ExperimentRunner:
             fee_rate,
             fee_sats,
             ";".join(result.tags),
+            result.input_tokens if result.input_tokens is not None else "",
+            result.output_tokens if result.output_tokens is not None else "",
+            result.total_tokens if result.total_tokens is not None else "",
+            f"{result.estimated_cost_usd:.6f}" if result.estimated_cost_usd is not None else "",
+            result.cost_source or "",
         ]
 
     def _persist_results_snapshot(self):

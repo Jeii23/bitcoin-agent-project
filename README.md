@@ -2,6 +2,12 @@
 
 HD wallet address derivation, PSBT (BIP-174) construction / decoding, UTXO listing and a natural‑language agent interface – hardened for safety (no synthetic addresses, strict checksum validation, explicit change handling, Taproot output support).
 
+## TFM Research Context
+
+This project is the implementation backbone for the TFM documented in `/home/jaume/feina/TFM/ResumTFM.md` and `/home/jaume/feina/TFM/PROGRESS.md`. The research question is not whether the tool can act as a production wallet, but whether an xpub-only LLM agent can construct unsigned PSBTs with better structural privacy under controlled experimental conditions.
+
+The current experiment workflow lives in `experiments/` and remains CSV/runner compatible. The Streamlit Web UI is a local researcher tool over the same runner. The 2026 TFM analysis treats `phase-1` and `phase-2` result folders as execution lots only; the substantive comparison is prompt-first (`basic`, `privacy_simple`, `multiturn_detailed`) across comparable models, amounts and temperatures.
+
 ## Key Features
 - BIP32/84 HD receive & change address derivation (via custom logic + `hdwallet` fallback).
 - Strict Bech32 / Bech32m checksum validation (BIP‑173 / BIP‑350). Mixed‑case rejected.
@@ -16,7 +22,7 @@ HD wallet address derivation, PSBT (BIP-174) construction / decoding, UTXO listi
 - Minimal dependency footprint (trimmed `requirements.txt`).
 - Taproot (v1) output script support (OP_1 0x51 + push32 + program). Tests include BIP‑350 vectors.
 - Comprehensive pytest suite (offline‑safe; HTTP calls monkey‑patched during tests).
-- Optional conversational agent (LangChain + OpenAI) that can:
+- Optional conversational agent (LangGraph/LangChain with OpenAI, Anthropic, Google, or OpenRouter models) that can:
   - Generate unused receive addresses
   - List UTXOs (receive + change chains)
   - Show balance & fee rates
@@ -46,6 +52,8 @@ pip install pytest
 # Run tests
 pytest -q
 ```
+
+For experiment execution, result inspection, and paper charts, see `experiments/README.md`.
 
 ## Core APIs
 ### Address Derivation

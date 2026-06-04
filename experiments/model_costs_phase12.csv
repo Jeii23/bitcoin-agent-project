@@ -1,0 +1,6 @@
+price_version,provider,model,category,input_price_per_1m_tokens,output_price_per_1m_tokens,pricing_note
+phase12-local-estimates-2026-04,openai,gpt-5.4,closed-source,5.00,15.00,Local estimate for current 2026 prompt-corpus analysis; replace with provider dashboard pricing for final cost claims.
+phase12-local-estimates-2026-04,anthropic,claude-sonnet-4-6,closed-source,3.00,15.00,Local estimate for current 2026 prompt-corpus analysis; replace with provider dashboard pricing for final cost claims.
+phase12-local-estimates-2026-04,openrouter,google/gemini-3.1-pro-preview,closed-source,2.50,10.00,Local estimate for current 2026 prompt-corpus analysis; replace with OpenRouter/provider dashboard pricing for final cost claims.
+phase12-local-estimates-2026-04,openrouter,google/gemma-4-31b-it,open-source,0.12,0.30,Local estimate for current 2026 prompt-corpus analysis; replace with OpenRouter/provider dashboard pricing for final cost claims.
+phase12-local-estimates-2026-04,openrouter,z-ai/glm-5.1,open-source,0.50,1.50,Local estimate for current 2026 prompt-corpus analysis; replace with OpenRouter/provider dashboard pricing for final cost claims.

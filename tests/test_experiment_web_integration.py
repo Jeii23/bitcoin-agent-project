@@ -29,12 +29,24 @@ from experiment_runner import (
 )
 from paper_charts import (
     PAPER_CHART_OPTIONS,
+    PHASE12_CHART_OPTIONS,
     aggregate_current_results,
     build_paper_chart,
+    build_phase12_chart,
     current_results_v2_scores,
     load_paper_chart_sources,
     prepare_aggregated_dataframe,
     prepare_v2_scores_dataframe,
+)
+from phase12_results import (
+    estimate_result_cost,
+    flatten_privacy_breakdown as flatten_phase12_privacy_breakdown,
+    infer_amount_pct,
+    infer_category,
+    infer_phase,
+    infer_prompt_type,
+    infer_temperature,
+    normalize_phase12_results,
 )
 from result_utils import (
     arrow_safe_dataframe,
@@ -1117,6 +1129,393 @@ def test_paper_charts_infer_phase2_prompt_and_category_from_tags():
     assert build_paper_chart("Score heatmap", agg, v2_df).to_dict()
 
 
+def test_phase12_tag_parsing_infers_academic_dimensions():
+    tags = "phase-2|prompt-multiturn-detailed|amt-pct-80|temp-1.0|openrouter|glm|open-weight"
+
+    assert infer_phase(tags, "exp_glm_phase2", "Phase 2 GLM") == "phase-2"
+    assert infer_amount_pct(tags) == 80.0
+    assert infer_prompt_type(tags) == "multiturn_detailed"
+    assert infer_temperature(tags) == 1.0
+    assert infer_category("openrouter", "z-ai/glm-5.1", tags) == "open-source"
+
+
+def test_phase12_flatten_privacy_breakdown_extracts_scorer_fields():
+    flat = flatten_phase12_privacy_breakdown({
+        "scores": {
+            "overall": 84,
+            "clustering": 100,
+            "change_detection": 80,
+            "fingerprinting": 95,
+            "metadata_leakage": 70,
+        },
+        "confidence": "high",
+        "confidence_numeric": 0.91,
+        "fee_sanity_ok": True,
+        "sanity_status": "ok",
+        "fee_analysis": {"fee_rate_sat_vb": 2.4, "fee_sats": 150},
+        "metadata": {
+            "num_inputs": 4,
+            "num_outputs": 3,
+            "total_input_sats": 100000,
+            "total_output_sats": 99850,
+        },
+        "equal_output_classification": {"pattern": "none", "max_equal_outputs": 1},
+        "change_guess": {"output_index": 2, "probability": 0.72},
+    })
+
+    assert flat["score_overall"] == 84
+    assert flat["score_clustering"] == 100
+    assert flat["fee_rate_sat_vb"] == 2.4
+    assert flat["fee_sats"] == 150
+    assert flat["num_inputs"] == 4
+    assert flat["num_outputs"] == 3
+    assert flat["equal_output_pattern"] == "none"
+    assert flat["change_probability"] == 0.72
+
+
+def test_phase12_rerun_overlay_prefers_recent_psbt_rows(tmp_path):
+    columns = [
+        "experiment_id",
+        "experiment_name",
+        "repetition",
+        "timestamp",
+        "llm_provider",
+        "llm_model",
+        "llm_temperature",
+        "user_prompt",
+        "success",
+        "error_message",
+        "execution_time_seconds",
+        "psbt_generated",
+        "privacy_score",
+        "privacy_grade",
+        "psbt_file",
+        "fee_sanity_ok",
+        "sanity_status",
+        "fee_rate_sat_vb",
+        "fee_sats",
+        "tags",
+        "input_tokens",
+        "output_tokens",
+        "total_tokens",
+        "estimated_cost_usd",
+        "cost_source",
+    ]
+    primary = tmp_path / "primary.csv"
+    rerun = tmp_path / "rerun.csv"
+    primary_rows = [
+        {
+            "experiment_id": "exp_a",
+            "experiment_name": "A",
+            "repetition": "1",
+            "timestamp": "2026-04-01 10:00:00",
+            "llm_provider": "openai",
+            "llm_model": "gpt-test",
+            "llm_temperature": "0.3",
+            "user_prompt": "Fes-me una PSBT que envii aproximadament el 10% del saldo actual.",
+            "success": "False",
+            "error_message": "Timeout",
+            "execution_time_seconds": "300",
+            "psbt_generated": "False",
+            "privacy_score": "",
+            "privacy_grade": "",
+            "psbt_file": "",
+            "fee_sanity_ok": "",
+            "sanity_status": "",
+            "fee_rate_sat_vb": "",
+            "fee_sats": "",
+            "tags": "phase-1|prompt-basic|amt-pct-10|temp-0.3|frontier",
+            "input_tokens": "",
+            "output_tokens": "",
+            "total_tokens": "",
+            "estimated_cost_usd": "",
+            "cost_source": "",
+        },
+        {
+            "experiment_id": "exp_b",
+            "experiment_name": "B",
+            "repetition": "1",
+            "timestamp": "2026-04-01 10:05:00",
+            "llm_provider": "openai",
+            "llm_model": "gpt-test",
+            "llm_temperature": "0.3",
+            "user_prompt": "Fes-me una PSBT que envii aproximadament el 30% del saldo actual.",
+            "success": "True",
+            "error_message": "",
+            "execution_time_seconds": "30",
+            "psbt_generated": "True",
+            "privacy_score": "90",
+            "privacy_grade": "A",
+            "psbt_file": "primary.psbt",
+            "fee_sanity_ok": "1",
+            "sanity_status": "ok",
+            "fee_rate_sat_vb": "2",
+            "fee_sats": "1000",
+            "tags": "phase-1|prompt-basic|amt-pct-30|temp-0.3|frontier",
+            "input_tokens": "100",
+            "output_tokens": "50",
+            "total_tokens": "150",
+            "estimated_cost_usd": "0.001",
+            "cost_source": "actual",
+        },
+    ]
+    rerun_rows = [
+        {
+            **primary_rows[0],
+            "timestamp": "2026-05-01 10:00:00",
+            "success": "True",
+            "error_message": "",
+            "execution_time_seconds": "40",
+            "psbt_generated": "True",
+            "privacy_score": "82",
+            "privacy_grade": "B",
+            "psbt_file": "rerun.psbt",
+            "fee_sanity_ok": "1",
+            "sanity_status": "ok",
+            "fee_rate_sat_vb": "3",
+            "fee_sats": "1200",
+        },
+        {
+            **primary_rows[1],
+            "timestamp": "2026-05-01 10:05:00",
+            "success": "False",
+            "error_message": "Later non-PSBT failure",
+            "psbt_generated": "False",
+            "privacy_score": "",
+            "privacy_grade": "",
+            "psbt_file": "",
+            "fee_sanity_ok": "",
+            "sanity_status": "",
+        },
+    ]
+    for path, rows in [(primary, primary_rows), (rerun, rerun_rows)]:
+        with path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=columns)
+            writer.writeheader()
+            writer.writerows(rows)
+
+    df = normalize_phase12_results(
+        [primary],
+        rerun_csv_paths=[rerun],
+        cost_table_path=tmp_path / "missing_prices.csv",
+    )
+
+    assert len(df) == 2
+    by_id = df.set_index("experiment_id")
+    assert by_id.loc["exp_a", "privacy_score"] == 82
+    assert by_id.loc["exp_a", "rerun_overlay_bool"] == True  # noqa: E712
+    assert "Timeout" not in str(by_id.loc["exp_a", "error_message"])
+    assert by_id.loc["exp_b", "privacy_score"] == 90
+    assert by_id.loc["exp_b", "rerun_overlay_bool"] == False  # noqa: E712
+
+
+def test_phase12_cost_calculation_actual_estimated_and_missing_price():
+    cost_table = pd.DataFrame([
+        {
+            "price_version": "test-prices",
+            "provider": "openai",
+            "model": "gpt-test",
+            "category": "closed-source",
+            "input_price_per_1m_tokens": 2.0,
+            "output_price_per_1m_tokens": 8.0,
+        },
+    ])
+
+    actual = estimate_result_cost(
+        model="gpt-test",
+        provider="openai",
+        input_tokens=1000,
+        output_tokens=500,
+        cost_table=cost_table,
+    )
+    assert actual["cost_source"] == "actual"
+    assert actual["estimated_cost_usd"] == 0.006
+    assert actual["total_tokens"] == 1500
+
+    estimated = estimate_result_cost(
+        model="gpt-test",
+        provider="openai",
+        tags="phase-1|prompt-basic|amt-pct-10",
+        cost_table=cost_table,
+    )
+    assert estimated["cost_source"] == "estimated"
+    assert estimated["estimated_input_tokens"] == 10500
+    assert estimated["estimated_cost_usd"] == 0.0314
+
+    missing = estimate_result_cost(
+        model="not-priced",
+        provider="openai",
+        input_tokens=1000,
+        output_tokens=500,
+        cost_table=cost_table,
+    )
+    assert missing["cost_source"] == "missing-price"
+    assert missing["estimated_cost_usd"] is None
+
+
+def test_phase12_altair_charts_build_valid_specs_from_synthetic_data():
+    def assert_phase12_spec_is_screen_friendly(spec):
+        assert "hconcat" not in spec
+        assert "column" not in spec.get("encoding", {})
+        assert "column" not in spec.get("facet", {})
+        width = spec.get("width")
+        if isinstance(width, (int, float)):
+            assert width <= 840
+        else:
+            assert width != "container"
+        for child_key in ("layer", "vconcat"):
+            for child in spec.get(child_key, []):
+                assert_phase12_spec_is_screen_friendly(child)
+        if "spec" in spec:
+            assert_phase12_spec_is_screen_friendly(spec["spec"])
+
+    rows = []
+    for model, category, provider, cost in [
+        ("gpt-5.4", "closed-source", "openai", 0.07),
+        ("z-ai/glm-5.1", "open-source", "openrouter", 0.01),
+    ]:
+        for amount in [10.0, 30.0]:
+            for temperature in [0.3, 1.0]:
+                for phase, prompt_type, prompt_label, base_score in [
+                    ("phase-1", "basic", "Basic", 76),
+                    ("phase-1", "privacy_simple", "Privacy Simple", 82),
+                    ("phase-2", "multiturn_detailed", "Multi-turn Detailed", 86),
+                ]:
+                    score = base_score + (amount / 100) + (2 if model == "gpt-5.4" else 0)
+                    rows.append({
+                        "experiment_id": f"{model}-{phase}-{prompt_type}-{amount}-{temperature}",
+                        "llm_model": model,
+                        "llm_provider": provider,
+                        "phase": phase,
+                        "phase_label": "Phase 1" if phase == "phase-1" else "Phase 2",
+                        "execution_lot_label": "Phase 1" if phase == "phase-1" else "Phase 2",
+                        "amount_pct": amount,
+                        "amount_label": f"{amount:g}%",
+                        "prompt_type": prompt_type,
+                        "prompt_label": prompt_label,
+                        "temperature": temperature,
+                        "temperature_label": f"T={temperature:g}",
+                        "category": category,
+                        "privacy_score": score,
+                        "usable_score": score,
+                        "fee_ok_bool": True,
+                        "fee_bad_bool": False,
+                        "failed_bool": False,
+                        "psbt_generated_bool": True,
+                        "score_clustering": 99,
+                        "score_change_detection": 84,
+                        "score_fingerprinting": 94,
+                        "fee_rate_sat_vb": 2.0 + amount / 100,
+                        "fee_sats": 140 + amount,
+                        "num_inputs": 2 + int(amount / 30),
+                        "num_outputs": 2 + int(amount >= 30),
+                        "estimated_cost_usd": cost,
+                        "cost_source": "estimated",
+                    })
+        rows.append({
+            "experiment_id": f"{model}-fee-bad",
+            "llm_model": model,
+            "llm_provider": provider,
+            "phase": "phase-2",
+            "phase_label": "Phase 2",
+            "execution_lot_label": "Phase 2",
+            "amount_pct": 95.0,
+            "amount_label": "95%",
+            "prompt_type": "multiturn_detailed",
+            "prompt_label": "Multi-turn Detailed",
+            "temperature": 1.0,
+            "temperature_label": "T=1",
+            "category": category,
+            "privacy_score": 60,
+            "usable_score": None,
+            "fee_ok_bool": False,
+            "fee_bad_bool": True,
+            "failed_bool": False,
+            "psbt_generated_bool": True,
+            "score_clustering": 90,
+            "score_change_detection": 60,
+            "score_fingerprinting": 80,
+            "fee_rate_sat_vb": 9000.0,
+            "fee_sats": 100000,
+            "num_inputs": 6,
+            "num_outputs": 3,
+            "estimated_cost_usd": cost,
+            "cost_source": "estimated",
+        })
+        rows.append({
+            "experiment_id": f"{model}-failed",
+            "llm_model": model,
+            "llm_provider": provider,
+            "phase": "phase-1",
+            "phase_label": "Phase 1",
+            "execution_lot_label": "Phase 1",
+            "amount_pct": 95.0,
+            "amount_label": "95%",
+            "prompt_type": "basic",
+            "prompt_label": "Basic",
+            "temperature": 1.0,
+            "temperature_label": "T=1",
+            "category": category,
+            "privacy_score": None,
+            "usable_score": None,
+            "fee_ok_bool": False,
+            "fee_bad_bool": False,
+            "failed_bool": True,
+            "psbt_generated_bool": False,
+            "score_clustering": None,
+            "score_change_detection": None,
+            "score_fingerprinting": None,
+            "fee_rate_sat_vb": None,
+            "fee_sats": None,
+            "num_inputs": None,
+            "num_outputs": None,
+            "estimated_cost_usd": cost,
+            "cost_source": "estimated",
+        })
+
+    df = pd.DataFrame(rows)
+    for chart_name in PHASE12_CHART_OPTIONS:
+        chart = build_phase12_chart(chart_name, df)
+        assert chart is not None, f"{chart_name} should be available from synthetic Phase 1/2 data"
+        spec = chart.to_dict()
+        assert spec
+        assert_phase12_spec_is_screen_friendly(spec)
+
+
+def test_phase12_temperature_effect_uses_grouped_independent_panels():
+    rows = []
+    for prompt_label, base_score in [
+        ("Basic", 78),
+        ("Privacy Simple", 82),
+        ("Multi-turn Detailed", 86),
+    ]:
+        for temperature in [0.3, 1.0]:
+            rows.append({
+                "experiment_id": f"{prompt_label}-{temperature}-ok",
+                "prompt_label": prompt_label,
+                "temperature": temperature,
+                "usable_score": base_score + temperature,
+                "fee_ok_bool": True,
+            })
+            rows.append({
+                "experiment_id": f"{prompt_label}-{temperature}-bad",
+                "prompt_label": prompt_label,
+                "temperature": temperature,
+                "usable_score": None,
+                "fee_ok_bool": False,
+            })
+
+    chart = build_phase12_chart("Temperature effect", pd.DataFrame(rows))
+    spec = chart.to_dict()
+
+    assert "vconcat" in spec
+    assert len(spec["vconcat"]) == 2
+    for child in spec["vconcat"]:
+        assert "xOffset" in child["encoding"]
+        assert "row" not in child.get("encoding", {})
+        assert child["encoding"]["y"].get("stack") is None
+
+
 def test_safe_prompt_mode_handles_older_meta_without_prompt_mode():
     class LegacyManager:
         def infer_prompt_mode(self, row):
@@ -1146,6 +1545,7 @@ def test_streamlit_all_pages_render_without_exceptions():
         "▶️ Run Experiments",
         "📈 Results",
         "🔍 Compare Results",
+        "📊 2026 Prompt Charts",
     ]
     app = AppTest.from_file(str(EXPERIMENTS_DIR / "web_ui.py"), default_timeout=20)
     app.run()

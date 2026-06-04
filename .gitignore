@@ -32,5 +32,8 @@ htmlcov/
 
 # Experiments results
 experiments/results/
+experiments/wallets/
+experiments/wallet_imports/**/*.psbt
+experiments/wallet_imports/**/*.base64
 experiments/*.base64
 experiments/*.psbt
