@@ -2,11 +2,15 @@
 
 HD wallet address derivation, PSBT (BIP-174) construction / decoding, UTXO listing and a natural‑language agent interface – hardened for safety (no synthetic addresses, strict checksum validation, explicit change handling, Taproot output support).
 
-## TFM Research Context
+## Research Context
 
-This project is the implementation backbone for the TFM documented in `/home/jaume/feina/TFM/ResumTFM.md` and `/home/jaume/feina/TFM/PROGRESS.md`. The research question is not whether the tool can act as a production wallet, but whether an xpub-only LLM agent can construct unsigned PSBTs with better structural privacy under controlled experimental conditions.
+This project is shared research infrastructure inside the multi-project `/feina` workspace. It supported the completed TFM and JNIC work, the existing CBT manuscript, and the active `privBTC` research. It is not itself the only active deliverable.
 
-The current experiment workflow lives in `experiments/` and remains CSV/runner compatible. The Streamlit Web UI is a local researcher tool over the same runner. The 2026 TFM analysis treats `phase-1` and `phase-2` result folders as execution lots only; the substantive comparison is prompt-first (`basic`, `privacy_simple`, `multiturn_detailed`) across comparable models, amounts and temperatures.
+Read `/home/jaume/feina/PROJECTS.md` and `/home/jaume/feina/PROGRESS.md` for workspace status, then read the target paper's local documentation. Implementation-level changes are recorded in `/home/jaume/feina/bitcoin-agent-project/PROGRESS.md`.
+
+The core research boundary remains unchanged: the agent is xpub-only and constructs unsigned PSBTs for controlled analysis. It is not a production wallet and must never gain private-key, signing, or broadcasting capability. The current experiment workflow remains CSV/runner compatible, and the Streamlit UI remains a local researcher tool.
+
+Paper-specific anonymity, terminology, and narrative rules belong to each paper directory rather than this implementation README.
 
 ## Key Features
 - BIP32/84 HD receive & change address derivation (via custom logic + `hdwallet` fallback).

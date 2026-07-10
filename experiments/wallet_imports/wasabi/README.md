@@ -11,7 +11,7 @@ Place unsigned BIP-174 PSBT exports here for the wallet baseline import adapter:
 The corresponding `wallet_baseline.csv` rows are disabled until these files
 exist. If Wasabi cannot create unsigned PSBTs from a watch-only or hardware-style
 wallet without a seed/passphrase in the automation path, leave the rows disabled
-and record the limitation in `TFM/PROGRESS.md`.
+and record the limitation in `bitcoin-agent-project/PROGRESS.md` and in the progress log of any paper that depends on the result.
 
 For the public-only skeleton trial, generate:
 

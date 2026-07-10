@@ -4,7 +4,7 @@ This directory contains the experiment workflow used to evaluate whether an xpub
 
 The code is research tooling, not a production wallet. It never handles private keys, never signs transactions, and never broadcasts transactions. The agent can inspect wallet state from an extended public key, construct unsigned BIP-174 PSBTs, and pass those PSBTs to an offline privacy scorer.
 
-Canonical TFM context lives in `/home/jaume/feina/TFM/ResumTFM.md`; chronological progress and decisions live in `/home/jaume/feina/TFM/PROGRESS.md`. Keep this README focused on how the experiment system runs and how the 2026 prompt-first charts are produced.
+Workspace and project status live in `/home/jaume/feina/PROJECTS.md` and `/home/jaume/feina/PROGRESS.md`. Implementation-level decisions belong in `/home/jaume/feina/bitcoin-agent-project/PROGRESS.md`; paper-specific decisions belong in the selected paper directory. Keep this README focused on how the experiment system runs, how historical corpora are normalized, and how reproducible outputs and charts are produced.
 
 ## What This Experiment System Does
 
@@ -343,7 +343,7 @@ experiments/results/phase1/experiments_20260422_114240.csv
 experiments/results/phase2_all_phase1_models_20260427_rerun/experiments_20260427_093606.csv
 ```
 
-The `phase1` and `phase2` directory names are retained as execution-lot traceability labels. They are not treated as separate experimental systems in the charts or in the TFM narrative. The main analytical axis is prompt strategy: `basic`, `privacy-simple`, and `multiturn-detailed`.
+The `phase1` and `phase2` directory names are retained as execution-lot traceability labels. They are not treated as separate experimental systems in the charts or in the CBT paper narrative. The main analytical axis is prompt strategy: `basic`, `privacy-simple`, and `multiturn-detailed`.
 
 Legacy February result files are not mixed into these figures. Generate paper-ready summaries and figures from the workspace root:
 
@@ -359,13 +359,23 @@ paper/TFM/figures/phase12/*.pdf
 paper/TFM/figures/phase12/*.png
 ```
 
+The CBT manuscript reads its figure copies from:
+
+```text
+paper/CBT/figures/phase12/
+paper/CBT/figures/wallet_baseline/
+paper/CBT/figures/
+```
+
+If you regenerate academic charts, explicitly synchronize any figures used by `paper/CBT/CBT2026.tex` into `paper/CBT/figures/` before treating the CBT manuscript as updated. Do not assume the CBT paper automatically reads from `paper/TFM/figures/`.
+
 The Streamlit sidebar also includes **2026 Prompt Charts**, which uses the same `phase12_results.py` normalization layer for interactive Altair charts.
 
 Historical runs did not store token usage, so the 2026 prompt cost charts use transparent local estimates from `model_costs_phase12.csv`. Future runner outputs include optional trailing token and cost columns when provider metadata exposes usage.
 
-## Active 2026 Matrix
+## Canonical 2026 Matrix
 
-The active `experiments.csv` is now the cleaned 2026 batch:
+The current `experiments.csv` is the cleaned 2026 batch used as the completed TFM corpus and the CBT paper corpus:
 
 - `100` enabled Phase 1 execution-lot rows:
   5 active models x 2 prompt strategies (`basic`, `privacy-simple`) x 5 amount targets (`10%`, `30%`, `50%`, `80%`, `95%`) x 2 temperatures (`0.3`, `1.0`)
